@@ -77,6 +77,23 @@ h1 {
   gap: 10px;
 }
 
+.upload-box.compact {
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+
+.field-label {
+  color: #344054;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.field-label.soft {
+  margin-top: 2px;
+  color: var(--muted);
+  font-weight: 700;
+}
+
 .upload-box input {
   width: 100%;
   padding: 10px;
@@ -275,6 +292,7 @@ iframe {
 .status-building,
 .status-installing,
 .status-extracting,
+.status-preparing,
 .status-publishing,
 .status-queued {
   color: var(--warning);

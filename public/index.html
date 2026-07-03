@@ -16,12 +16,25 @@
           </div>
 
           <form id="uploadForm" class="upload-box">
+            <label class="field-label" for="projectFile">完整项目 zip</label>
             <input id="projectFile" type="file" accept=".zip,application/zip" />
             <button type="submit">上传并构建</button>
           </form>
 
           <div class="hint">
             上传包含 <code>package.json</code> 的 zip，平台会在本机执行 <code>npm install</code> 和 <code>npm run build</code>。
+          </div>
+
+          <form id="vueComponentForm" class="upload-box compact">
+            <label class="field-label" for="componentFile">Vue 组件沙箱</label>
+            <input id="componentFile" type="file" accept=".vue" />
+            <label class="field-label soft" for="demoFile">可选 App.vue 示例</label>
+            <input id="demoFile" type="file" accept=".vue" />
+            <button type="submit">上传组件并预览</button>
+          </form>
+
+          <div class="hint">
+            只上传组件时会自动生成示例页；上传 <code>App.vue</code> 时可直接使用 <code>&lt;SharedComponent /&gt;</code>。
           </div>
 
           <div>

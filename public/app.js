@@ -1,5 +1,8 @@
 const uploadForm = document.querySelector("#uploadForm");
+const vueComponentForm = document.querySelector("#vueComponentForm");
 const projectFile = document.querySelector("#projectFile");
+const componentFile = document.querySelector("#componentFile");
+const demoFile = document.querySelector("#demoFile");
 const projectList = document.querySelector("#projectList");
 const projectName = document.querySelector("#projectName");
 const projectMeta = document.querySelector("#projectMeta");
@@ -25,6 +28,39 @@ uploadForm.addEventListener("submit", async (event) => {
   formData.append("project", file);
 
   const response = await fetch("/api/projects/upload", {
+    method: "POST",
+    body: formData
+  });
+
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({ error: "Upload failed" }));
+    alert(error.error || "上传失败");
+    return;
+  }
+
+  const { project } = await response.json();
+  selectedProjectId = project.id;
+  renderProject(project);
+  await loadProjects();
+  startPolling(project.id);
+});
+
+vueComponentForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+
+  const component = componentFile.files[0];
+  if (!component) {
+    alert("先选择一个 .vue 组件文件。");
+    return;
+  }
+
+  const formData = new FormData();
+  formData.append("component", component);
+  if (demoFile.files[0]) {
+    formData.append("demo", demoFile.files[0]);
+  }
+
+  const response = await fetch("/api/components/vue/upload", {
     method: "POST",
     body: formData
   });

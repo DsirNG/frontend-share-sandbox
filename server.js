@@ -71,7 +71,7 @@ app.post("/api/projects/upload", uploadProject, async (req, res) => {
     return;
   }
 
-  const projectId = nanoid(10);
+  const projectId = nanoid(10).toLowerCase();
   const originalName = req.file.originalname || "project.zip";
   const projectDir = path.join(projectsDir, projectId);
   const previewDir = path.join(previewsDir, projectId);
@@ -99,6 +99,49 @@ app.post("/api/projects/upload", uploadProject, async (req, res) => {
   });
 });
 
+app.post("/api/components/vue/upload", uploadVueComponent, async (req, res) => {
+  const componentFile = req.files?.component?.[0];
+  const demoFile = req.files?.demo?.[0];
+
+  if (!componentFile) {
+    res.status(400).json({ error: "Please upload a .vue component file." });
+    return;
+  }
+
+  const projectId = nanoid(10).toLowerCase();
+  const componentName = toPascalCase(path.basename(componentFile.originalname, ".vue")) || "SharedComponent";
+  const projectDir = path.join(projectsDir, projectId);
+  const previewDir = path.join(previewsDir, projectId);
+
+  const record = {
+    id: projectId,
+    name: componentName,
+    status: "queued",
+    createdAt: new Date().toISOString(),
+    previewUrl: null,
+    scripts: {},
+    dependencies: {},
+    framework: "Vue Component",
+    rootFiles: [],
+    logs: []
+  };
+
+  projects.set(projectId, record);
+  res.status(202).json({ project: record });
+
+  buildVueComponentSandbox({
+    projectId,
+    componentName,
+    componentPath: componentFile.path,
+    demoPath: demoFile?.path,
+    projectDir,
+    previewDir
+  }).catch((error) => {
+    record.status = "failed";
+    record.logs.push(`Fatal error: ${error.message}`);
+  });
+});
+
 function uploadProject(req, res, next) {
   upload.single("project")(req, res, (error) => {
     if (!error) {
@@ -115,14 +158,34 @@ function uploadProject(req, res, next) {
   });
 }
 
+function uploadVueComponent(req, res, next) {
+  upload.fields([
+    { name: "component", maxCount: 1 },
+    { name: "demo", maxCount: 1 }
+  ])(req, res, (error) => {
+    if (!error) {
+      next();
+      return;
+    }
+
+    if (error instanceof multer.MulterError && error.code === "LIMIT_FILE_SIZE") {
+      res.status(413).json({ error: `File is too large. Current limit is ${maxUploadMb} MB.` });
+      return;
+    }
+
+    next(error);
+  });
+}
+
 app.use("/preview/:projectId", async (req, res, next) => {
-  const project = projects.get(req.params.projectId);
-  if (!project || project.status !== "ready") {
+  const project = findProject(req.params.projectId);
+  const storedProjectId = project?.id || await findStoredPreviewId(req.params.projectId);
+  if ((project && project.status !== "ready") || !storedProjectId) {
     res.status(404).send("Preview is not ready.");
     return;
   }
 
-  const staticRoot = path.join(previewsDir, req.params.projectId);
+  const staticRoot = path.join(previewsDir, storedProjectId);
   express.static(staticRoot, {
     fallthrough: true,
     maxAge: "5m"
@@ -201,7 +264,70 @@ async function buildUploadedProject({ projectId, uploadPath, projectDir, preview
   record.logs.push(`Published preview from ${path.relative(sourceDir, distDir) || "."}.`);
 }
 
-function servePreviewHost(req, res, next) {
+async function buildVueComponentSandbox({ projectId, componentName, componentPath, demoPath, projectDir, previewDir }) {
+  const record = projects.get(projectId);
+  record.status = "preparing";
+  const componentSource = await fs.readFile(componentPath, "utf8");
+  const demoSource = demoPath ? await fs.readFile(demoPath, "utf8") : "";
+  const sandboxOptions = analyzeVueSandbox(componentSource, demoSource);
+
+  await fs.rm(projectDir, { recursive: true, force: true });
+  await fs.rm(previewDir, { recursive: true, force: true });
+  await fs.mkdir(path.join(projectDir, "src", "components"), { recursive: true });
+  await fs.mkdir(previewDir, { recursive: true });
+
+  await fs.copyFile(componentPath, path.join(projectDir, "src", "components", "SharedComponent.vue"));
+  await fs.rm(componentPath, { force: true });
+
+  if (demoPath) {
+    await fs.copyFile(demoPath, path.join(projectDir, "src", "App.vue"));
+    await fs.rm(demoPath, { force: true });
+    record.logs.push("Using uploaded App.vue as the component demo.");
+  } else {
+    await fs.writeFile(path.join(projectDir, "src", "App.vue"), createDefaultVueDemo(componentName, componentSource), "utf8");
+    record.logs.push("Generated a default Vue demo wrapper.");
+  }
+
+  if (sandboxOptions.detectedDependencies.length) {
+    record.logs.push(`Detected component dependencies: ${sandboxOptions.detectedDependencies.join(", ")}`);
+  }
+
+  await fs.writeFile(path.join(projectDir, "package.json"), createVuePackageJson(componentName, sandboxOptions.dependencies), "utf8");
+  await fs.writeFile(path.join(projectDir, "index.html"), createVueIndexHtml(componentName), "utf8");
+  await fs.writeFile(path.join(projectDir, "src", "main.ts"), createVueMainTs(sandboxOptions), "utf8");
+  await fs.writeFile(path.join(projectDir, "src", "style.css"), createVuePreviewCss(), "utf8");
+  await fs.writeFile(path.join(projectDir, "vite.config.ts"), createVueViteConfig(), "utf8");
+  await fs.writeFile(path.join(projectDir, "tsconfig.json"), createVueTsConfig(), "utf8");
+
+  record.rootFiles = await listRootFiles(projectDir);
+  record.scripts = { build: "vite build" };
+  record.dependencies = {
+    ...sandboxOptions.dependencies
+  };
+
+  record.status = "installing";
+  await runCommand(getNpmCommand(), ["install"], projectDir, record);
+
+  record.status = "building";
+  await runCommand(getNpmCommand(), ["run", "build", "--", "--base", "/"], projectDir, record);
+
+  const distDir = await findBuildOutput(projectDir);
+  if (!distDir) {
+    record.status = "failed";
+    record.logs.push("Build finished, but no dist output folder was found.");
+    return;
+  }
+
+  record.status = "publishing";
+  await copyDirectory(distDir, previewDir);
+  await ensureSpaFallback(previewDir);
+
+  record.previewUrl = getPreviewUrl(projectId);
+  record.status = "ready";
+  record.logs.push("Published Vue component sandbox from dist.");
+}
+
+async function servePreviewHost(req, res, next) {
   const host = req.hostname.toLowerCase();
   const match = host.match(/^([a-z0-9_-]+)\.localhost$/);
   if (!match) {
@@ -210,12 +336,13 @@ function servePreviewHost(req, res, next) {
   }
 
   const project = findProject(match[1]);
-  if (!project || project.status !== "ready") {
+  const storedProjectId = project?.id || await findStoredPreviewId(match[1]);
+  if ((project && project.status !== "ready") || !storedProjectId) {
     res.status(404).send("Preview is not ready.");
     return;
   }
 
-  const staticRoot = path.join(previewsDir, project.id);
+  const staticRoot = path.join(previewsDir, storedProjectId);
   express.static(staticRoot, {
     fallthrough: true,
     maxAge: "5m"
@@ -226,6 +353,17 @@ function servePreviewHost(req, res, next) {
 
 function findProject(id) {
   return projects.get(id) || [...projects.values()].find((project) => project.id.toLowerCase() === id.toLowerCase());
+}
+
+async function findStoredPreviewId(id) {
+  const directPath = path.join(previewsDir, id);
+  if (await pathExists(directPath)) {
+    return id;
+  }
+
+  const entries = await fs.readdir(previewsDir, { withFileTypes: true }).catch(() => []);
+  const match = entries.find((entry) => entry.isDirectory() && entry.name.toLowerCase() === id.toLowerCase());
+  return match?.name || null;
 }
 
 async function ensureStorage() {
@@ -388,6 +526,282 @@ function getBuildArgs(record, projectId) {
 
 function getPreviewUrl(projectId) {
   return `http://${projectId.toLowerCase()}.localhost:${port}/`;
+}
+
+function toPascalCase(value) {
+  return value
+    .replace(/[^a-zA-Z0-9]+/g, " ")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join("");
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+function analyzeVueSandbox(componentSource, demoSource) {
+  const source = `${componentSource}\n${demoSource}`;
+  const dependencies = {
+    "@vitejs/plugin-vue": "^5.2.1",
+    "typescript": "^5.5.4",
+    "vite": "^5.4.8",
+    "vue": "^3.5.13"
+  };
+  const knownDependencyVersions = {
+    "@vueuse/core": "^12.0.0",
+    "gsap": "^3.12.5",
+    "lucide-vue-next": "^0.468.0",
+    "pinia": "^2.3.0",
+    "vue-router": "^4.5.0"
+  };
+
+  for (const dependency of extractBareImports(source)) {
+    if (knownDependencyVersions[dependency]) {
+      dependencies[dependency] = knownDependencyVersions[dependency];
+    }
+  }
+
+  return {
+    dependencies,
+    detectedDependencies: Object.keys(dependencies).filter((dependency) => !["@vitejs/plugin-vue", "typescript", "vite", "vue"].includes(dependency)),
+    needsRouter: Boolean(dependencies["vue-router"])
+  };
+}
+
+function extractBareImports(source) {
+  const imports = new Set();
+  const importPattern = /(?:import|export)\s+(?:[^'"]*?\s+from\s+)?['"]([^'"]+)['"]|import\(\s*['"]([^'"]+)['"]\s*\)/g;
+  let match;
+
+  while ((match = importPattern.exec(source))) {
+    const specifier = match[1] || match[2];
+    if (!specifier || specifier.startsWith(".") || specifier.startsWith("/") || specifier.startsWith("@/")) continue;
+
+    const packageName = specifier.startsWith("@")
+      ? specifier.split("/").slice(0, 2).join("/")
+      : specifier.split("/")[0];
+    imports.add(packageName);
+  }
+
+  return imports;
+}
+
+function createVuePackageJson(componentName, dependencies) {
+  return `${JSON.stringify({
+    name: `${componentName.replace(/[A-Z]/g, (letter, index) => `${index ? "-" : ""}${letter.toLowerCase()}`)}-sandbox`,
+    version: "0.1.0",
+    private: true,
+    type: "module",
+    scripts: {
+      build: "vite build"
+    },
+    dependencies
+  }, null, 2)}\n`;
+}
+
+function createVueIndexHtml(componentName) {
+  return `<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>${escapeHtml(componentName)} Sandbox</title>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
+`;
+}
+
+function createVueMainTs(options) {
+  if (options.needsRouter) {
+    return `import { createApp } from 'vue'
+import { createRouter, createWebHistory } from 'vue-router'
+import App from './App.vue'
+import SharedComponent from './components/SharedComponent.vue'
+import './style.css'
+
+const router = createRouter({
+  history: createWebHistory(),
+  routes: [
+    { path: '/', component: { template: '<span />' } },
+    { path: '/:pathMatch(.*)*', redirect: '/' }
+  ]
+})
+
+createApp(App)
+  .component('SharedComponent', SharedComponent)
+  .use(router)
+  .mount('#app')
+`;
+  }
+
+  return `import { createApp } from 'vue'
+import App from './App.vue'
+import SharedComponent from './components/SharedComponent.vue'
+import './style.css'
+
+createApp(App)
+  .component('SharedComponent', SharedComponent)
+  .mount('#app')
+`;
+}
+
+function createDefaultVueDemo(componentName, componentSource) {
+  const componentProps = createDefaultVueComponentProps(componentSource);
+  const componentAttrs = componentProps.length
+    ? `\n          ${componentProps.join("\n          ")}\n        `
+    : " ";
+
+  return `<script setup lang="ts">
+import SharedComponent from './components/SharedComponent.vue'
+</script>
+
+<template>
+  <main class="preview-page">
+    <section class="preview-surface">
+      <p class="preview-kicker">Vue Component Sandbox</p>
+      <h1>${escapeHtml(componentName)}</h1>
+      <div class="component-stage">
+        <SharedComponent${componentAttrs}/>
+      </div>
+    </section>
+  </main>
+</template>
+
+<style scoped>
+.preview-page {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 48px;
+  color: #111827;
+  background: #f5f7fb;
+}
+
+.preview-surface {
+  width: min(720px, calc(100vw - 32px));
+  padding: 32px;
+  border: 1px solid #dce3ec;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.preview-kicker {
+  margin: 0 0 8px;
+  color: #0f766e;
+  font-size: 12px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+h1 {
+  margin: 0 0 28px;
+  font-size: 28px;
+}
+
+.component-stage {
+  min-height: 180px;
+  display: grid;
+  place-items: center;
+  padding: 32px;
+  border: 1px dashed #b8c3d1;
+  border-radius: 8px;
+  background: #fbfcfe;
+}
+</style>
+`;
+}
+
+function createDefaultVueComponentProps(componentSource) {
+  const props = [];
+
+  if (hasRequiredProp(componentSource, "title")) {
+    props.push('title="Preview Action"');
+  } else if (hasRequiredProp(componentSource, "label")) {
+    props.push('label="Preview Action"');
+  } else if (hasProp(componentSource, "text")) {
+    props.push('text="Preview Action"');
+  }
+
+  if (hasProp(componentSource, "desc")) {
+    props.push('desc="Generated by the component sandbox"');
+  }
+
+  if (hasProp(componentSource, "to") && /['"]vue-router['"]/.test(componentSource)) {
+    props.push(':to="{ path: \'/\' }"');
+  }
+
+  if (hasProp(componentSource, "variant")) {
+    props.push('variant="dark"');
+  }
+
+  return props;
+}
+
+function hasProp(source, propName) {
+  return new RegExp(`\\b${propName}\\s*:`, "m").test(source);
+}
+
+function hasRequiredProp(source, propName) {
+  return new RegExp(`\\b${propName}\\s*:\\s*\\{[\\s\\S]*?required\\s*:\\s*true`, "m").test(source);
+}
+
+function createVuePreviewCss() {
+  return `:root {
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: #111827;
+  background: #f5f7fb;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+`;
+}
+
+function createVueViteConfig() {
+  return `import { defineConfig } from 'vite'
+import vue from '@vitejs/plugin-vue'
+
+export default defineConfig({
+  plugins: [vue()]
+})
+`;
+}
+
+function createVueTsConfig() {
+  return `${JSON.stringify({
+    compilerOptions: {
+      target: "ES2020",
+      useDefineForClassFields: true,
+      module: "ESNext",
+      lib: ["ES2020", "DOM", "DOM.Iterable"],
+      skipLibCheck: true,
+      moduleResolution: "Bundler",
+      allowImportingTsExtensions: true,
+      isolatedModules: true,
+      moduleDetection: "force",
+      noEmit: true,
+      jsx: "preserve",
+      strict: true
+    },
+    include: ["src/**/*.ts", "src/**/*.tsx", "src/**/*.vue"]
+  }, null, 2)}\n`;
 }
 
 async function findBuildOutput(sourceDir) {
