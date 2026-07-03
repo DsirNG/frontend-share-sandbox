@@ -71,7 +71,7 @@ app.post("/api/projects/upload", uploadProject, async (req, res) => {
     return;
   }
 
-  const projectId = nanoid(10).toLowerCase();
+  const projectId = createProjectId();
   const originalName = req.file.originalname || "project.zip";
   const projectDir = path.join(projectsDir, projectId);
   const previewDir = path.join(previewsDir, projectId);
@@ -108,7 +108,7 @@ app.post("/api/components/vue/upload", uploadVueComponent, async (req, res) => {
     return;
   }
 
-  const projectId = nanoid(10).toLowerCase();
+  const projectId = createProjectId();
   const componentName = toPascalCase(path.basename(componentFile.originalname, ".vue")) || "SharedComponent";
   const projectDir = path.join(projectsDir, projectId);
   const previewDir = path.join(previewsDir, projectId);
@@ -134,6 +134,7 @@ app.post("/api/components/vue/upload", uploadVueComponent, async (req, res) => {
     componentName,
     componentPath: componentFile.path,
     demoPath: demoFile?.path,
+    externalCss: req.body.externalCss,
     projectDir,
     previewDir
   }).catch((error) => {
@@ -264,12 +265,12 @@ async function buildUploadedProject({ projectId, uploadPath, projectDir, preview
   record.logs.push(`Published preview from ${path.relative(sourceDir, distDir) || "."}.`);
 }
 
-async function buildVueComponentSandbox({ projectId, componentName, componentPath, demoPath, projectDir, previewDir }) {
+async function buildVueComponentSandbox({ projectId, componentName, componentPath, demoPath, externalCss, projectDir, previewDir }) {
   const record = projects.get(projectId);
   record.status = "preparing";
   const componentSource = await fs.readFile(componentPath, "utf8");
   const demoSource = demoPath ? await fs.readFile(demoPath, "utf8") : "";
-  const sandboxOptions = analyzeVueSandbox(componentSource, demoSource);
+  const sandboxOptions = analyzeVueSandbox(componentSource, demoSource, externalCss);
 
   await fs.rm(projectDir, { recursive: true, force: true });
   await fs.rm(previewDir, { recursive: true, force: true });
@@ -292,8 +293,12 @@ async function buildVueComponentSandbox({ projectId, componentName, componentPat
     record.logs.push(`Detected component dependencies: ${sandboxOptions.detectedDependencies.join(", ")}`);
   }
 
+  if (sandboxOptions.externalCss.length) {
+    record.logs.push(`Injected external CSS: ${sandboxOptions.externalCss.join(", ")}`);
+  }
+
   await fs.writeFile(path.join(projectDir, "package.json"), createVuePackageJson(componentName, sandboxOptions.dependencies), "utf8");
-  await fs.writeFile(path.join(projectDir, "index.html"), createVueIndexHtml(componentName), "utf8");
+  await fs.writeFile(path.join(projectDir, "index.html"), createVueIndexHtml(componentName, sandboxOptions), "utf8");
   await fs.writeFile(path.join(projectDir, "src", "main.ts"), createVueMainTs(sandboxOptions), "utf8");
   await fs.writeFile(path.join(projectDir, "src", "style.css"), createVuePreviewCss(), "utf8");
   await fs.writeFile(path.join(projectDir, "vite.config.ts"), createVueViteConfig(), "utf8");
@@ -353,6 +358,14 @@ async function servePreviewHost(req, res, next) {
 
 function findProject(id) {
   return projects.get(id) || [...projects.values()].find((project) => project.id.toLowerCase() === id.toLowerCase());
+}
+
+function createProjectId() {
+  let suffix = "";
+  while (suffix.length < 10) {
+    suffix += nanoid(10).toLowerCase().replace(/[^a-z0-9]/g, "");
+  }
+  return `p${suffix.slice(0, 10)}`;
 }
 
 async function findStoredPreviewId(id) {
@@ -547,7 +560,7 @@ function escapeHtml(value) {
     .replaceAll("'", "&#039;");
 }
 
-function analyzeVueSandbox(componentSource, demoSource) {
+function analyzeVueSandbox(componentSource, demoSource, externalCssInput = "") {
   const source = `${componentSource}\n${demoSource}`;
   const dependencies = {
     "@vitejs/plugin-vue": "^5.2.1",
@@ -569,11 +582,44 @@ function analyzeVueSandbox(componentSource, demoSource) {
     }
   }
 
+  const externalCss = normalizeExternalCss(externalCssInput);
+  const autoCss = [];
+  if (usesFontAwesome(source)) {
+    autoCss.push("https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css");
+  }
+
+  for (const href of autoCss) {
+    if (!externalCss.includes(href)) {
+      externalCss.unshift(href);
+    }
+  }
+
   return {
     dependencies,
     detectedDependencies: Object.keys(dependencies).filter((dependency) => !["@vitejs/plugin-vue", "typescript", "vite", "vue"].includes(dependency)),
-    needsRouter: Boolean(dependencies["vue-router"])
+    needsRouter: Boolean(dependencies["vue-router"]),
+    externalCss
   };
+}
+
+function normalizeExternalCss(input) {
+  return String(input || "")
+    .split(/[\n,]+/)
+    .map((value) => value.trim())
+    .filter(Boolean)
+    .filter((value) => {
+      try {
+        const url = new URL(value);
+        return ["http:", "https:"].includes(url.protocol);
+      } catch {
+        return false;
+      }
+    })
+    .slice(0, 8);
+}
+
+function usesFontAwesome(source) {
+  return /\b(?:fa|fas|far|fab|fal|fad|fa-solid|fa-regular|fa-brands)\b/.test(source);
 }
 
 function extractBareImports(source) {
@@ -607,14 +653,19 @@ function createVuePackageJson(componentName, dependencies) {
   }, null, 2)}\n`;
 }
 
-function createVueIndexHtml(componentName) {
+function createVueIndexHtml(componentName, options) {
+  const cssLinks = options.externalCss
+    .map((href) => `    <link rel="stylesheet" href="${escapeHtml(href)}" />`)
+    .join("\n");
+  const maybeCssLinks = cssLinks ? `${cssLinks}\n` : "";
+
   return `<!doctype html>
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>${escapeHtml(componentName)} Sandbox</title>
-  </head>
+${maybeCssLinks}  </head>
   <body>
     <div id="app"></div>
     <script type="module" src="/src/main.ts"></script>

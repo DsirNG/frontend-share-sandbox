@@ -27,7 +27,8 @@ body {
 }
 
 button,
-input {
+input,
+textarea {
   font: inherit;
 }
 
@@ -100,6 +101,21 @@ h1 {
   border: 1px dashed #aeb8c5;
   border-radius: 8px;
   background: #fbfcfd;
+}
+
+.upload-box textarea {
+  width: 100%;
+  min-height: 74px;
+  resize: vertical;
+  padding: 10px;
+  border: 1px solid #c7d0dc;
+  border-radius: 8px;
+  background: #fbfcfd;
+  color: var(--text);
+}
+
+.upload-box textarea::placeholder {
+  color: #98a2b3;
 }
 
 .upload-box button,

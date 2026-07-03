@@ -3,6 +3,7 @@ const vueComponentForm = document.querySelector("#vueComponentForm");
 const projectFile = document.querySelector("#projectFile");
 const componentFile = document.querySelector("#componentFile");
 const demoFile = document.querySelector("#demoFile");
+const externalCss = document.querySelector("#externalCss");
 const projectList = document.querySelector("#projectList");
 const projectName = document.querySelector("#projectName");
 const projectMeta = document.querySelector("#projectMeta");
@@ -58,6 +59,9 @@ vueComponentForm.addEventListener("submit", async (event) => {
   formData.append("component", component);
   if (demoFile.files[0]) {
     formData.append("demo", demoFile.files[0]);
+  }
+  if (externalCss.value.trim()) {
+    formData.append("externalCss", externalCss.value.trim());
   }
 
   const response = await fetch("/api/components/vue/upload", {
