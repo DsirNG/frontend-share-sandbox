@@ -35,6 +35,25 @@ const ignoredArchiveDirs = new Set([
   "node_modules",
   "out"
 ]);
+const readableFileExtensions = new Set([
+  ".cjs",
+  ".css",
+  ".html",
+  ".js",
+  ".json",
+  ".jsx",
+  ".md",
+  ".mjs",
+  ".svg",
+  ".ts",
+  ".tsx",
+  ".txt",
+  ".vue",
+  ".xml",
+  ".yml",
+  ".yaml"
+]);
+const maxReadableFileBytes = 1024 * 1024;
 
 const upload = multer({
   dest: uploadsDir,
@@ -65,6 +84,65 @@ app.get("/api/projects/:id", (req, res) => {
   res.json({ project });
 });
 
+app.get("/api/projects/:id/files", async (req, res) => {
+  try {
+    const sourceDir = await getProjectSourceDir(req.params.id);
+    if (!sourceDir) {
+      res.status(404).json({ error: "Project files not found." });
+      return;
+    }
+
+    const tree = await buildFileTree(sourceDir);
+    res.json({ tree });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/projects/:id/files/content", async (req, res) => {
+  try {
+    const sourceDir = await getProjectSourceDir(req.params.id);
+    if (!sourceDir) {
+      res.status(404).json({ error: "Project files not found." });
+      return;
+    }
+
+    const relativePath = String(req.query.path || "");
+    const filePath = resolveProjectPath(sourceDir, relativePath);
+    if (!filePath) {
+      res.status(400).json({ error: "Invalid file path." });
+      return;
+    }
+
+    const stat = await fs.stat(filePath);
+    if (!stat.isFile()) {
+      res.status(400).json({ error: "Path is not a file." });
+      return;
+    }
+
+    const extension = path.extname(filePath).toLowerCase();
+    if (!readableFileExtensions.has(extension)) {
+      res.status(415).json({ error: "This file type is not available as text." });
+      return;
+    }
+
+    if (stat.size > maxReadableFileBytes) {
+      res.status(413).json({ error: "File is too large to preview." });
+      return;
+    }
+
+    const content = await fs.readFile(filePath, "utf8");
+    res.json({
+      path: normalizeRelativePath(path.relative(sourceDir, filePath)),
+      extension,
+      size: stat.size,
+      content
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.post("/api/projects/upload", uploadProject, async (req, res) => {
   if (!req.file) {
     res.status(400).json({ error: "Please upload a zip file." });
@@ -86,6 +164,7 @@ app.post("/api/projects/upload", uploadProject, async (req, res) => {
     scripts: {},
     dependencies: {},
     framework: "unknown",
+    sourceDir: null,
     rootFiles: [],
     logs: []
   };
@@ -122,6 +201,7 @@ app.post("/api/components/vue/upload", uploadVueComponent, async (req, res) => {
     scripts: {},
     dependencies: {},
     framework: "Vue Component",
+    sourceDir: null,
     rootFiles: [],
     logs: []
   };
@@ -213,6 +293,7 @@ async function buildUploadedProject({ projectId, uploadPath, projectDir, preview
   await fs.rm(uploadPath, { force: true });
 
   const sourceDir = await findProjectRoot(projectDir);
+  record.sourceDir = sourceDir;
   record.rootFiles = await listRootFiles(sourceDir);
 
   const packageJsonPath = path.join(sourceDir, "package.json");
@@ -304,6 +385,7 @@ async function buildVueComponentSandbox({ projectId, componentName, componentPat
   await fs.writeFile(path.join(projectDir, "vite.config.ts"), createVueViteConfig(), "utf8");
   await fs.writeFile(path.join(projectDir, "tsconfig.json"), createVueTsConfig(), "utf8");
 
+  record.sourceDir = projectDir;
   record.rootFiles = await listRootFiles(projectDir);
   record.scripts = { build: "vite build" };
   record.dependencies = {
@@ -366,6 +448,97 @@ function createProjectId() {
     suffix += nanoid(10).toLowerCase().replace(/[^a-z0-9]/g, "");
   }
   return `p${suffix.slice(0, 10)}`;
+}
+
+async function getProjectSourceDir(projectId) {
+  const project = findProject(projectId);
+  if (project?.sourceDir && await pathExists(project.sourceDir)) {
+    return project.sourceDir;
+  }
+
+  const projectDir = path.join(projectsDir, projectId);
+  if (!(await pathExists(projectDir))) {
+    const entries = await fs.readdir(projectsDir, { withFileTypes: true }).catch(() => []);
+    const match = entries.find((entry) => entry.isDirectory() && entry.name.toLowerCase() === projectId.toLowerCase());
+    if (!match) return null;
+    return findProjectRoot(path.join(projectsDir, match.name));
+  }
+
+  return findProjectRoot(projectDir);
+}
+
+async function buildFileTree(sourceDir) {
+  const counter = { count: 0 };
+  const children = await readTreeChildren(sourceDir, sourceDir, 0, counter);
+  return {
+    name: path.basename(sourceDir),
+    path: "",
+    type: "dir",
+    children
+  };
+}
+
+async function readTreeChildren(rootDir, currentDir, depth, counter) {
+  if (depth > 8 || counter.count > 700) return [];
+
+  const entries = await fs.readdir(currentDir, { withFileTypes: true });
+  const visibleEntries = entries
+    .filter((entry) => !entry.name.startsWith("__MACOSX"))
+    .filter((entry) => !ignoredArchiveDirs.has(entry.name))
+    .filter((entry) => !entry.name.startsWith(".") || [".env.example", ".gitignore"].includes(entry.name))
+    .sort((a, b) => {
+      if (a.isDirectory() !== b.isDirectory()) return a.isDirectory() ? -1 : 1;
+      return a.name.localeCompare(b.name);
+    });
+
+  const nodes = [];
+  for (const entry of visibleEntries) {
+    if (counter.count > 700) break;
+
+    const absolutePath = path.join(currentDir, entry.name);
+    const relativePath = normalizeRelativePath(path.relative(rootDir, absolutePath));
+    counter.count += 1;
+
+    if (entry.isDirectory()) {
+      nodes.push({
+        name: entry.name,
+        path: relativePath,
+        type: "dir",
+        children: await readTreeChildren(rootDir, absolutePath, depth + 1, counter)
+      });
+      continue;
+    }
+
+    if (entry.isFile()) {
+      const stat = await fs.stat(absolutePath);
+      nodes.push({
+        name: entry.name,
+        path: relativePath,
+        type: "file",
+        size: stat.size,
+        readable: readableFileExtensions.has(path.extname(entry.name).toLowerCase()) && stat.size <= maxReadableFileBytes
+      });
+    }
+  }
+
+  return nodes;
+}
+
+function resolveProjectPath(sourceDir, relativePath) {
+  const normalized = normalizeRelativePath(relativePath);
+  if (!normalized || normalized.includes("\0")) return null;
+
+  const absolutePath = path.resolve(sourceDir, normalized);
+  const relative = path.relative(sourceDir, absolutePath);
+  if (relative.startsWith("..") || path.isAbsolute(relative)) {
+    return null;
+  }
+
+  return absolutePath;
+}
+
+function normalizeRelativePath(relativePath) {
+  return String(relativePath || "").replace(/\\/g, "/").replace(/^\/+/, "");
 }
 
 async function findStoredPreviewId(id) {

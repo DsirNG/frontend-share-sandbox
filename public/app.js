@@ -8,13 +8,21 @@ const projectList = document.querySelector("#projectList");
 const projectName = document.querySelector("#projectName");
 const projectMeta = document.querySelector("#projectMeta");
 const openPreview = document.querySelector("#openPreview");
+const previewWrap = document.querySelector(".preview-wrap");
 const previewFrame = document.querySelector("#previewFrame");
 const emptyState = document.querySelector("#emptyState");
+const fileExplorer = document.querySelector("#fileExplorer");
+const fileTree = document.querySelector("#fileTree");
+const activeFilePath = document.querySelector("#activeFilePath");
+const fileContent = document.querySelector("#fileContent");
+const details = document.querySelector(".details");
 const analysis = document.querySelector("#analysis");
 const logs = document.querySelector("#logs");
 
 let selectedProjectId = null;
 let pollTimer = null;
+let explorerProjectId = null;
+let selectedFilePath = null;
 
 uploadForm.addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -149,17 +157,108 @@ function renderProject(project) {
   if (project.status === "ready" && project.previewUrl) {
     openPreview.href = project.previewUrl;
     openPreview.classList.remove("disabled");
-    previewFrame.src = `${project.previewUrl}?t=${Date.now()}`;
-    emptyState.classList.add("hidden");
+    previewFrame.removeAttribute("src");
+    previewWrap.classList.add("hidden");
+    details.classList.add("hidden");
+    fileExplorer.classList.remove("hidden");
+    loadFileExplorer(project.id);
   } else {
     openPreview.href = "#";
     openPreview.classList.add("disabled");
     previewFrame.removeAttribute("src");
+    previewWrap.classList.remove("hidden");
+    details.classList.remove("hidden");
+    fileExplorer.classList.add("hidden");
     emptyState.classList.remove("hidden");
-    emptyState.textContent = project.status === "failed" ? "构建失败" : "构建中...";
+    emptyState.textContent = project.status === "failed" ? "构建失败，请查看日志。" : "上传成功，正在解析和构建...";
   }
 
   renderAnalysis(project);
+}
+
+async function loadFileExplorer(projectId) {
+  if (explorerProjectId === projectId) return;
+
+  explorerProjectId = projectId;
+  selectedFilePath = null;
+  fileTree.innerHTML = `<div class="hint">正在加载文件目录...</div>`;
+  activeFilePath.textContent = "选择一个文件";
+  fileContent.textContent = "正在解析项目文件...";
+
+  const response = await fetch(`/api/projects/${projectId}/files`);
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({ error: "文件目录加载失败" }));
+    fileTree.innerHTML = `<div class="hint">${escapeHtml(error.error)}</div>`;
+    fileContent.textContent = error.error;
+    return;
+  }
+
+  const { tree } = await response.json();
+  fileTree.innerHTML = "";
+  renderFileNodes(tree.children || [], fileTree, 0, projectId);
+
+  const firstFile = findFirstReadableFile(tree);
+  if (firstFile) {
+    await openFile(projectId, firstFile.path);
+  } else {
+    activeFilePath.textContent = "没有可预览的文本文件";
+    fileContent.textContent = "这个项目没有找到可直接预览的文本文件。";
+  }
+}
+
+function renderFileNodes(nodes, container, depth, projectId) {
+  for (const node of nodes) {
+    const item = document.createElement(node.type === "file" && node.readable ? "button" : "div");
+    item.className = `file-node ${node.type}${node.readable === false ? " unreadable" : ""}`;
+    item.style.paddingLeft = `${8 + depth * 14}px`;
+    item.dataset.path = node.path;
+
+    const prefix = node.type === "dir" ? "[dir]" : "[file]";
+    item.innerHTML = `<span>${prefix}</span><span class="file-node-name">${escapeHtml(node.name)}</span>`;
+
+    if (node.type === "file" && node.readable) {
+      item.addEventListener("click", () => openFile(projectId, node.path));
+    }
+
+    container.appendChild(item);
+
+    if (node.type === "dir" && node.children?.length) {
+      renderFileNodes(node.children, container, depth + 1, projectId);
+    }
+  }
+}
+
+function findFirstReadableFile(node) {
+  if (node.type === "file" && node.readable) return node;
+  for (const child of node.children || []) {
+    const result = findFirstReadableFile(child);
+    if (result) return result;
+  }
+  return null;
+}
+
+async function openFile(projectId, path) {
+  selectedFilePath = path;
+  activeFilePath.textContent = path;
+  fileContent.textContent = "正在加载文件...";
+  updateActiveFileNode(path);
+
+  const response = await fetch(`/api/projects/${projectId}/files/content?path=${encodeURIComponent(path)}`);
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({ error: "文件加载失败" }));
+    fileContent.textContent = error.error;
+    return;
+  }
+
+  const file = await response.json();
+  activeFilePath.textContent = file.path;
+  fileContent.textContent = file.content;
+}
+
+function updateActiveFileNode(path) {
+  for (const node of fileTree.querySelectorAll(".file-node")) {
+    node.classList.toggle("active", node.dataset.path === path);
+  }
 }
 
 function renderAnalysis(project) {
