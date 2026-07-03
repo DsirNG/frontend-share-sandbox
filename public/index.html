@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Frontend Share Sandbox</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="workspace">
+        <aside class="panel sidebar">
+          <div>
+            <p class="eyebrow">Local Preview Lab</p>
+            <h1>前端项目分享沙箱</h1>
+          </div>
+
+          <form id="uploadForm" class="upload-box">
+            <input id="projectFile" type="file" accept=".zip,application/zip" />
+            <button type="submit">上传并构建</button>
+          </form>
+
+          <div class="hint">
+            上传包含 <code>package.json</code> 的 zip，平台会在本机执行 <code>npm install</code> 和 <code>npm run build</code>。
+          </div>
+
+          <div>
+            <div class="section-title">项目列表</div>
+            <div id="projectList" class="project-list"></div>
+          </div>
+        </aside>
+
+        <section class="main-area">
+          <div class="panel status-panel">
+            <div>
+              <div id="projectName" class="project-name">还没有项目</div>
+              <div id="projectMeta" class="project-meta">上传 zip 后会在这里看到构建状态。</div>
+            </div>
+            <a id="openPreview" class="open-link disabled" href="#" target="_blank" rel="noreferrer">打开预览</a>
+          </div>
+
+          <div class="preview-wrap">
+            <iframe id="previewFrame" title="项目预览"></iframe>
+            <div id="emptyState" class="empty-state">预览区域</div>
+          </div>
+
+          <div class="details">
+            <section class="panel">
+              <div class="section-title">项目分析</div>
+              <div id="analysis" class="analysis-grid"></div>
+            </section>
+
+            <section class="panel">
+              <div class="section-title">构建日志</div>
+              <pre id="logs" class="logs">等待上传...</pre>
+            </section>
+          </div>
+        </section>
+      </section>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>
