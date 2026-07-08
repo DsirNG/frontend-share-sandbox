@@ -8,18 +8,32 @@ import express from "express";
 import multer from "multer";
 import unzipper from "unzipper";
 import { nanoid } from "nanoid";
+import iconv from "iconv-lite";
+import jwt from "jsonwebtoken";
+import Redis from "ioredis";
+import pool from "./db/pool.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-const port = Number(process.env.PORT || 3020);
+const port = Number(process.env.PORT || 3010);
 
 const storageRoot = path.join(__dirname, "storage");
 const uploadsDir = path.join(storageRoot, "uploads");
 const projectsDir = path.join(storageRoot, "projects");
 const previewsDir = path.join(storageRoot, "previews");
 const maxUploadMb = Number(process.env.MAX_UPLOAD_MB || 250);
+
+/** JWT 密钥，与 Spring Boot 后端保持一致 */
+const JWT_SECRET = process.env.JWT_SECRET || "xander-lab-secret-key-must-be-at-least-32-chars-for-hmac";
+
+/** 每用户最大项目数，超出后自动清理最旧的 */
+const MAX_PROJECTS_PER_USER = Number(process.env.MAX_PROJECTS_PER_USER || 20);
+
+/** Redis 前缀，与 Java 后端 Constants.java 保持一致 */
+const REDIS_TOKEN_PREFIX = "login:token:";
+
 const ignoredArchiveDirs = new Set([
   ".git",
   ".next",
@@ -55,6 +69,225 @@ const readableFileExtensions = new Set([
 ]);
 const maxReadableFileBytes = 1024 * 1024;
 
+/** Redis 客户端，用于校验 token 是否仍活跃（与 Java 后端共享同一 Redis） */
+const redis = new Redis({
+  host: process.env.REDIS_HOST || "localhost",
+  port: Number(process.env.REDIS_PORT || 6379),
+  lazyConnect: true,
+});
+
+redis.on("error", (err) => {
+  console.error("[Redis] Connection error:", err.message);
+});
+
+// ──────────────────────────────────────────────
+// MySQL 数据访问层
+// ──────────────────────────────────────────────
+
+/**
+ * 创建项目记录
+ * @param {object} project - 项目字段
+ * @returns {Promise<object>} 创建的项目记录
+ */
+async function createProject(project) {
+  const { id, user_id, name, status, framework, preview_url, scripts, dependencies, root_files, logs } = project;
+  await pool.execute(
+    `INSERT INTO studio_project (id, user_id, name, status, framework, preview_url, scripts, dependencies, root_files, logs)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [id, user_id, name, status || "queued", framework || "unknown", preview_url,
+     JSON.stringify(scripts || {}), JSON.stringify(dependencies || {}),
+     JSON.stringify(root_files || []), JSON.stringify(logs || [])]
+  );
+  return getProjectById(id);
+}
+
+/**
+ * 根据 ID 查询单个项目
+ * @param {string} id - 项目 ID
+ * @returns {Promise<object|null>} 项目记录或 null
+ */
+async function getProjectById(id) {
+  const [rows] = await pool.execute("SELECT * FROM studio_project WHERE id = ?", [id]);
+  if (rows.length === 0) return null;
+  return deserializeProject(rows[0]);
+}
+
+/**
+ * 查询用户的所有项目（按创建时间倒序）
+ * @param {number} userId - 用户 ID
+ * @returns {Promise<object[]>} 项目列表
+ */
+async function getProjectsByUserId(userId) {
+  const [rows] = await pool.execute(
+    "SELECT * FROM studio_project WHERE user_id = ? ORDER BY created_at DESC",
+    [userId]
+  );
+  return rows.map(deserializeProject);
+}
+
+/**
+ * 更新项目状态
+ * @param {string} id - 项目 ID
+ * @param {string} status - 新状态
+ */
+async function updateProjectStatus(id, status) {
+  await pool.execute("UPDATE studio_project SET status = ? WHERE id = ?", [status, id]);
+}
+
+/**
+ * 更新项目的全部可变字段（构建完成后调用）
+ * @param {string} id - 项目 ID
+ * @param {object} fields - 要更新的字段
+ */
+async function updateProjectFull(id, fields) {
+  const sets = [];
+  const values = [];
+  for (const [key, value] of Object.entries(fields)) {
+    const col = camelToSnake(key);
+    if (["scripts", "dependencies", "root_files", "logs"].includes(col)) {
+      sets.push(`${col} = ?`);
+      values.push(JSON.stringify(value));
+    } else {
+      sets.push(`${col} = ?`);
+      values.push(value);
+    }
+  }
+  if (sets.length === 0) return;
+  values.push(id);
+  await pool.execute(`UPDATE studio_project SET ${sets.join(", ")} WHERE id = ?`, values);
+}
+
+/**
+ * 删除项目记录
+ * @param {string} id - 项目 ID
+ */
+async function deleteProjectById(id) {
+  await pool.execute("DELETE FROM studio_project WHERE id = ?", [id]);
+}
+
+/**
+ * 清理用户超出限额的旧项目（保留最新的 MAX_PROJECTS_PER_USER 个）
+ * @param {number} userId - 用户 ID
+ */
+async function cleanupOldProjects(userId) {
+  const [rows] = await pool.execute(
+    "SELECT id FROM studio_project WHERE user_id = ? ORDER BY created_at DESC LIMIT 1000",
+    [userId]
+  );
+  if (rows.length <= MAX_PROJECTS_PER_USER) return;
+
+  const toDelete = rows.slice(MAX_PROJECTS_PER_USER);
+  for (const row of toDelete) {
+    await deleteProjectById(row.id);
+    // 清理磁盘上的预览文件
+    await fs.rm(path.join(previewsDir, row.id), { recursive: true, force: true }).catch(() => {});
+    await fs.rm(path.join(projectsDir, row.id), { recursive: true, force: true }).catch(() => {});
+    console.log(`[Cleanup] Deleted project ${row.id} for user ${userId}`);
+  }
+}
+
+/**
+ * 将 MySQL 行反序列化为前端友好的项目对象
+ * @param {object} row - MySQL 行
+ * @returns {object} 反序列化后的项目对象
+ */
+function deserializeProject(row) {
+  return {
+    id: row.id,
+    userId: row.user_id,
+    name: row.name,
+    status: row.status,
+    framework: row.framework,
+    previewUrl: row.preview_url,
+    scripts: safeJsonParse(row.scripts, {}),
+    dependencies: safeJsonParse(row.dependencies, {}),
+    rootFiles: safeJsonParse(row.root_files, []),
+    logs: safeJsonParse(row.logs, []),
+    createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : String(row.created_at),
+  };
+}
+
+/**
+ * 安全解析 JSON 字符串
+ * @param {string|null} str - JSON 字符串
+ * @param {*} fallback - 解析失败时的默认值
+ * @returns {*} 解析结果
+ */
+function safeJsonParse(str, fallback) {
+  if (str == null) return fallback;
+  if (typeof str === "object") return str;
+  try { return JSON.parse(str); } catch { return fallback; }
+}
+
+/**
+ * camelCase 转 snake_case
+ * @param {string} str - camelCase 字符串
+ * @returns {string} snake_case 字符串
+ */
+function camelToSnake(str) {
+  return str.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`);
+}
+
+// ──────────────────────────────────────────────
+// JWT 鉴权中间件
+// ──────────────────────────────────────────────
+
+/**
+ * JWT 鉴权中间件
+ * 验证 token 签名 + 检查 Redis 中 token 是否仍活跃
+ * 通过后设置 req.userId
+ */
+async function authMiddleware(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    sendError(res, 401, "未登录或登录已过期");
+    return;
+  }
+
+  const token = authHeader.substring(7);
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    // 检查 Redis 中 token 是否仍存在（与 Java 后端逻辑一致）
+    const redisValue = await redis.get(REDIS_TOKEN_PREFIX + token);
+    if (!redisValue) {
+      sendError(res, 401, "未登录或登录已过期");
+      return;
+    }
+    req.userId = Number(decoded.sub || redisValue);
+    next();
+  } catch (err) {
+    sendError(res, 401, "未登录或登录已过期");
+  }
+}
+
+// ──────────────────────────────────────────────
+// 编码检测
+// ──────────────────────────────────────────────
+
+/**
+ * 检测文本编码并返回 UTF-8 字符串
+ * 优先 UTF-8，若检测到乱码则回退到 GBK（兼容中文 Windows 生成的文件）
+ * @param {Buffer} buf - 文件原始字节
+ * @returns {string} UTF-8 编码的文本内容
+ */
+function decodeTextContent(buf) {
+  const utf8Str = buf.toString("utf8");
+  if (!utf8Str.includes("\uFFFD")) {
+    const nonAscii = utf8Str.replace(/[\x00-\x7f]/g, "");
+    if (nonAscii.length === 0) return utf8Str;
+    const gbkStr = iconv.decode(buf, "gbk");
+    if (/[\u4e00-\u9fff]/.test(gbkStr) && !/[\u4e00-\u9fff]/.test(utf8Str)) {
+      return gbkStr;
+    }
+    return utf8Str;
+  }
+  return iconv.decode(buf, "gbk");
+}
+
+// ──────────────────────────────────────────────
+// Multer 上传配置
+// ──────────────────────────────────────────────
+
 const upload = multer({
   dest: uploadsDir,
   limits: {
@@ -62,76 +295,172 @@ const upload = multer({
   }
 });
 
-const projects = new Map();
+// ──────────────────────────────────────────────
+// 请求日志中间件 & 错误响应辅助
+// ──────────────────────────────────────────────
+
+/**
+ * 请求日志中间件：记录每个请求的完整响应信息
+ * 拦截 res.json() 捕获响应体，在 res.end() 时输出格式化日志
+ */
+function requestLogger(req, res, next) {
+  const start = Date.now();
+  let responseBody = "";
+
+  // 拦截 json() 调用以捕获响应体
+  const originalJson = res.json.bind(res);
+  res.json = (body) => {
+    responseBody = JSON.stringify(body);
+    return originalJson(body);
+  };
+
+  // 拦截 send() 调用以捕获纯文本响应
+  const originalSend = res.send.bind(res);
+  res.send = (body) => {
+    if (typeof body === "string") responseBody = body;
+    return originalSend(body);
+  };
+
+  const originalEnd = res.end;
+  res.end = function (...args) {
+    const duration = Date.now() - start;
+    const method = req.method;
+    const uri = req.originalUrl || req.url;
+    const status = res.statusCode;
+    const separator = "================";
+    const header = `${separator} OUTGOING RESPONSE ${separator}`;
+    const footer = "=".repeat(header.length);
+
+    console.log(
+      `\n${header}\n` +
+      `Method : ${method}\n` +
+      `URI    : ${uri}\n` +
+      `Status : ${status}\n` +
+      `Time   : ${duration} ms\n` +
+      `Res Body: ${responseBody || "(empty)"}\n` +
+      `${footer}`
+    );
+    originalEnd.apply(res, args);
+  };
+  next();
+}
+
+/**
+ * 发送统一格式的错误响应 { code, message, data: null }
+ * @param {object} res - Express response 对象
+ * @param {number} code - HTTP 状态码
+ * @param {string} message - 错误消息
+ */
+function sendError(res, code, message) {
+  res.status(code).json({ code, message, data: null });
+}
+
+// ──────────────────────────────────────────────
+// Express 中间件 & 路由
+// ──────────────────────────────────────────────
 
 app.use(express.json());
+app.use(requestLogger);
 app.use(servePreviewHost);
 app.use("/", express.static(path.join(__dirname, "public")));
 
-app.get("/api/projects", (_req, res) => {
-  res.json({
-    projects: [...projects.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt))
-  });
-});
-
-app.get("/api/projects/:id", (req, res) => {
-  const project = projects.get(req.params.id);
-  if (!project) {
-    res.status(404).json({ error: "Project not found" });
-    return;
-  }
-
-  res.json({ project });
-});
-
-app.get("/api/projects/:id/files", async (req, res) => {
+/**
+ * GET /api/projects - 获取当前用户的所有项目
+ */
+app.get("/api/projects", authMiddleware, async (req, res) => {
   try {
+    const projects = await getProjectsByUserId(req.userId);
+    res.json({ projects });
+  } catch (error) {
+    console.error("[GET /api/projects]", error.message);
+    sendError(res, 500, "加载项目失败");
+  }
+});
+
+/**
+ * GET /api/projects/:id - 获取单个项目详情
+ */
+app.get("/api/projects/:id", authMiddleware, async (req, res) => {
+  try {
+    const project = await findProject(req.params.id);
+    if (!project || project.userId !== req.userId) {
+      sendError(res, 404, "项目不存在");
+      return;
+    }
+    res.json({ project });
+  } catch (error) {
+    console.error("[GET /api/projects/:id]", error.message);
+    sendError(res, 500, "加载项目失败");
+  }
+});
+
+/**
+ * GET /api/projects/:id/files - 获取项目文件树
+ */
+app.get("/api/projects/:id/files", authMiddleware, async (req, res) => {
+  try {
+    const project = await findProject(req.params.id);
+    if (!project || project.userId !== req.userId) {
+      sendError(res, 404, "项目不存在");
+      return;
+    }
+
     const sourceDir = await getProjectSourceDir(req.params.id);
     if (!sourceDir) {
-      res.status(404).json({ error: "Project files not found." });
+      sendError(res, 404, "项目文件不存在");
       return;
     }
 
     const tree = await buildFileTree(sourceDir);
     res.json({ tree });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    sendError(res, 500, error.message || "加载文件树失败");
   }
 });
 
-app.get("/api/projects/:id/files/content", async (req, res) => {
+/**
+ * GET /api/projects/:id/files/content - 获取项目文件内容
+ */
+app.get("/api/projects/:id/files/content", authMiddleware, async (req, res) => {
   try {
+    const project = await findProject(req.params.id);
+    if (!project || project.userId !== req.userId) {
+      sendError(res, 404, "项目不存在");
+      return;
+    }
+
     const sourceDir = await getProjectSourceDir(req.params.id);
     if (!sourceDir) {
-      res.status(404).json({ error: "Project files not found." });
+      sendError(res, 404, "项目文件不存在");
       return;
     }
 
     const relativePath = String(req.query.path || "");
     const filePath = resolveProjectPath(sourceDir, relativePath);
     if (!filePath) {
-      res.status(400).json({ error: "Invalid file path." });
+      sendError(res, 400, "无效的文件路径");
       return;
     }
 
     const stat = await fs.stat(filePath);
     if (!stat.isFile()) {
-      res.status(400).json({ error: "Path is not a file." });
+      sendError(res, 400, "路径不是文件");
       return;
     }
 
     const extension = path.extname(filePath).toLowerCase();
     if (!readableFileExtensions.has(extension)) {
-      res.status(415).json({ error: "This file type is not available as text." });
+      sendError(res, 415, "该文件类型不支持文本预览");
       return;
     }
 
     if (stat.size > maxReadableFileBytes) {
-      res.status(413).json({ error: "File is too large to preview." });
+      sendError(res, 413, "文件过大，无法预览");
       return;
     }
 
-    const content = await fs.readFile(filePath, "utf8");
+    const rawBuf = await fs.readFile(filePath);
+    const content = decodeTextContent(rawBuf);
     res.json({
       path: normalizeRelativePath(path.relative(sourceDir, filePath)),
       extension,
@@ -139,13 +468,16 @@ app.get("/api/projects/:id/files/content", async (req, res) => {
       content
     });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    sendError(res, 500, error.message || "加载文件失败");
   }
 });
 
-app.post("/api/projects/upload", uploadProject, async (req, res) => {
+/**
+ * POST /api/projects/upload - 上传 zip 项目
+ */
+app.post("/api/projects/upload", authMiddleware, uploadProject, async (req, res) => {
   if (!req.file) {
-    res.status(400).json({ error: "Please upload a zip file." });
+    sendError(res, 400, "请上传 zip 文件");
     return;
   }
 
@@ -157,6 +489,7 @@ app.post("/api/projects/upload", uploadProject, async (req, res) => {
 
   const record = {
     id: projectId,
+    userId: req.userId,
     name: originalName.replace(/\.zip$/i, ""),
     status: "queued",
     createdAt: new Date().toISOString(),
@@ -169,21 +502,47 @@ app.post("/api/projects/upload", uploadProject, async (req, res) => {
     logs: []
   };
 
-  projects.set(projectId, record);
-  res.status(202).json({ project: record });
+  try {
+    // 写入 MySQL
+    await createProject({
+      id: projectId,
+      user_id: req.userId,
+      name: record.name,
+      status: "queued",
+      framework: "unknown",
+      preview_url: null,
+      scripts: {},
+      dependencies: {},
+      root_files: [],
+      logs: [],
+    });
 
-  buildUploadedProject({ projectId, uploadPath, projectDir, previewDir }).catch((error) => {
-    record.status = "failed";
-    record.logs.push(`Fatal error: ${error.message}`);
-  });
+    res.status(202).json({ project: record });
+
+    // 异步构建
+    buildUploadedProject({ projectId, uploadPath, projectDir, previewDir }).catch(async (error) => {
+      await updateProjectFull(projectId, { status: "failed", logs: [`Fatal error: ${error.message}`] });
+    });
+
+    // 清理超出限额的旧项目
+    cleanupOldProjects(req.userId).catch((err) => {
+      console.error("[Cleanup] Error:", err.message);
+    });
+  } catch (error) {
+    console.error("[Upload]", error.message);
+    sendError(res, 500, "创建项目失败");
+  }
 });
 
-app.post("/api/components/vue/upload", uploadVueComponent, async (req, res) => {
+/**
+ * POST /api/components/vue/upload - 上传 Vue 组件
+ */
+app.post("/api/components/vue/upload", authMiddleware, uploadVueComponent, async (req, res) => {
   const componentFile = req.files?.component?.[0];
   const demoFile = req.files?.demo?.[0];
 
   if (!componentFile) {
-    res.status(400).json({ error: "Please upload a .vue component file." });
+    sendError(res, 400, "请上传 .vue 组件文件");
     return;
   }
 
@@ -194,6 +553,7 @@ app.post("/api/components/vue/upload", uploadVueComponent, async (req, res) => {
 
   const record = {
     id: projectId,
+    userId: req.userId,
     name: componentName,
     status: "queued",
     createdAt: new Date().toISOString(),
@@ -206,22 +566,46 @@ app.post("/api/components/vue/upload", uploadVueComponent, async (req, res) => {
     logs: []
   };
 
-  projects.set(projectId, record);
-  res.status(202).json({ project: record });
+  try {
+    await createProject({
+      id: projectId,
+      user_id: req.userId,
+      name: componentName,
+      status: "queued",
+      framework: "Vue Component",
+      preview_url: null,
+      scripts: {},
+      dependencies: {},
+      root_files: [],
+      logs: [],
+    });
 
-  buildVueComponentSandbox({
-    projectId,
-    componentName,
-    componentPath: componentFile.path,
-    demoPath: demoFile?.path,
-    externalCss: req.body.externalCss,
-    projectDir,
-    previewDir
-  }).catch((error) => {
-    record.status = "failed";
-    record.logs.push(`Fatal error: ${error.message}`);
-  });
+    res.status(202).json({ project: record });
+
+    buildVueComponentSandbox({
+      projectId,
+      componentName,
+      componentPath: componentFile.path,
+      demoPath: demoFile?.path,
+      externalCss: req.body.externalCss,
+      projectDir,
+      previewDir
+    }).catch(async (error) => {
+      await updateProjectFull(projectId, { status: "failed", logs: [`Fatal error: ${error.message}`] });
+    });
+
+    cleanupOldProjects(req.userId).catch((err) => {
+      console.error("[Cleanup] Error:", err.message);
+    });
+  } catch (error) {
+    console.error("[Vue Upload]", error.message);
+    sendError(res, 500, "创建项目失败");
+  }
 });
+
+// ──────────────────────────────────────────────
+// Multer 中间件
+// ──────────────────────────────────────────────
 
 function uploadProject(req, res, next) {
   upload.single("project")(req, res, (error) => {
@@ -231,7 +615,7 @@ function uploadProject(req, res, next) {
     }
 
     if (error instanceof multer.MulterError && error.code === "LIMIT_FILE_SIZE") {
-      res.status(413).json({ error: `Zip is too large. Current limit is ${maxUploadMb} MB.` });
+      sendError(res, 413, `文件过大，当前限制 ${maxUploadMb} MB`);
       return;
     }
 
@@ -250,7 +634,7 @@ function uploadVueComponent(req, res, next) {
     }
 
     if (error instanceof multer.MulterError && error.code === "LIMIT_FILE_SIZE") {
-      res.status(413).json({ error: `File is too large. Current limit is ${maxUploadMb} MB.` });
+      sendError(res, 413, `文件过大，当前限制 ${maxUploadMb} MB`);
       return;
     }
 
@@ -258,11 +642,24 @@ function uploadVueComponent(req, res, next) {
   });
 }
 
+// ──────────────────────────────────────────────
+// 预览服务
+// ──────────────────────────────────────────────
+
+/**
+ * /preview/:projectId 路径预览（带路径前缀）
+ */
 app.use("/preview/:projectId", async (req, res, next) => {
-  const project = findProject(req.params.projectId);
+  const project = await findProject(req.params.projectId);
   const storedProjectId = project?.id || await findStoredPreviewId(req.params.projectId);
-  if ((project && project.status !== "ready") || !storedProjectId) {
-    res.status(404).send("Preview is not ready.");
+  if (!storedProjectId) {
+    sendError(res, 404, "预览尚未准备好");
+    return;
+  }
+
+  // 如果有项目记录，检查状态
+  if (project && project.status !== "ready") {
+    sendError(res, 404, "预览尚未准备好");
     return;
   }
 
@@ -275,80 +672,127 @@ app.use("/preview/:projectId", async (req, res, next) => {
   });
 });
 
+// ──────────────────────────────────────────────
+// 启动
+// ──────────────────────────────────────────────
+
 app.listen(port, async () => {
   await ensureStorage();
+  // 尝试连接 Redis（非阻塞，失败时仅警告）
+  try {
+    await redis.connect();
+    console.log("[Redis] Connected");
+  } catch (err) {
+    console.warn("[Redis] Failed to connect:", err.message);
+  }
   console.log(`Frontend share sandbox is running at http://localhost:${port}`);
 });
 
+// ──────────────────────────────────────────────
+// 构建流程
+// ──────────────────────────────────────────────
+
+/**
+ * 构建上传的 zip 项目
+ * 流程：解压 → 检测框架 → npm install → npm build → 复制 dist 到预览目录
+ * @param {object} params - 构建参数
+ */
 async function buildUploadedProject({ projectId, uploadPath, projectDir, previewDir }) {
-  const record = projects.get(projectId);
-  record.status = "extracting";
+  await updateProjectStatus(projectId, "extracting");
 
   await fs.rm(projectDir, { recursive: true, force: true });
   await fs.rm(previewDir, { recursive: true, force: true });
   await fs.mkdir(projectDir, { recursive: true });
   await fs.mkdir(previewDir, { recursive: true });
 
-  await extractZipSafely(uploadPath, projectDir, record);
+  // 用临时 logs 数组收集日志，构建完成后一次性写入 MySQL
+  const logs = [];
+
+  await extractZipSafely(uploadPath, projectDir, { logs });
   await fs.rm(uploadPath, { force: true });
 
   const sourceDir = await findProjectRoot(projectDir);
-  record.sourceDir = sourceDir;
-  record.rootFiles = await listRootFiles(sourceDir);
+  const rootFiles = await listRootFiles(sourceDir);
 
   const packageJsonPath = path.join(sourceDir, "package.json");
   const hasPackageJson = await pathExists(packageJsonPath);
 
   if (!hasPackageJson) {
-    record.status = "publishing";
-    record.framework = "static";
+    await updateProjectFull(projectId, {
+      status: "publishing",
+      framework: "static",
+      rootFiles,
+      logs: [...logs, "No package.json found. Publishing as a static site."],
+    });
     await copyStaticProject(sourceDir, previewDir);
-    record.previewUrl = getPreviewUrl(projectId);
-    record.status = "ready";
-    record.logs.push("No package.json found. Published files as a static site.");
+    await updateProjectFull(projectId, {
+      status: "ready",
+      previewUrl: getPreviewUrl(projectId),
+      logs: [...logs, "No package.json found. Published files as a static site."],
+    });
     return;
   }
 
   const packageJson = JSON.parse(await fs.readFile(packageJsonPath, "utf8"));
-  record.name = packageJson.name || record.name;
-  record.scripts = packageJson.scripts || {};
-  record.dependencies = {
-    ...packageJson.dependencies,
-    ...packageJson.devDependencies
-  };
-  record.framework = detectFramework(packageJson);
+  const name = packageJson.name || (await getProjectById(projectId))?.name || projectId;
+  const scripts = packageJson.scripts || {};
+  const dependencies = { ...packageJson.dependencies, ...packageJson.devDependencies };
+  const framework = detectFramework(packageJson);
 
-  if (!record.scripts.build) {
-    record.status = "failed";
-    record.logs.push("package.json does not contain a build script.");
+  // 更新项目元信息
+  await updateProjectFull(projectId, {
+    name,
+    scripts,
+    dependencies,
+    framework,
+    rootFiles,
+    logs,
+  });
+
+  if (!scripts.build) {
+    logs.push("package.json does not contain a build script.");
+    await updateProjectFull(projectId, { status: "failed", logs });
     return;
   }
 
-  record.status = "installing";
-  await runCommand(getNpmCommand(), ["install"], sourceDir, record);
+  // npm install
+  await updateProjectStatus(projectId, "installing");
+  await runCommand(getNpmCommand(), ["install"], sourceDir, { logs });
 
-  record.status = "building";
-  await runCommand(getNpmCommand(), getBuildArgs(record, projectId), sourceDir, record);
+  // npm build
+  await updateProjectStatus(projectId, "building");
+  const buildRecord = { dependencies, logs };
+  await runCommand(getNpmCommand(), getBuildArgs(buildRecord, projectId), sourceDir, { logs });
 
   const distDir = await findBuildOutput(sourceDir);
   if (!distDir) {
-    record.status = "failed";
-    record.logs.push("Build finished, but no dist/build/public output folder was found.");
+    logs.push("Build finished, but no dist/build/public output folder was found.");
+    await updateProjectFull(projectId, { status: "failed", logs });
     return;
   }
 
-  record.status = "publishing";
+  // 发布
+  await updateProjectStatus(projectId, "publishing");
   await copyDirectory(distDir, previewDir);
   await ensureSpaFallback(previewDir);
 
-  record.previewUrl = getPreviewUrl(projectId);
-  record.status = "ready";
-  record.logs.push(`Published preview from ${path.relative(sourceDir, distDir) || "."}.`);
+  logs.push(`Published preview from ${path.relative(sourceDir, distDir) || "."}.`);
+  await updateProjectFull(projectId, {
+    status: "ready",
+    previewUrl: getPreviewUrl(projectId),
+    logs,
+  });
 }
 
+/**
+ * 构建 Vue 组件沙箱
+ * 流程：解析组件 → 生成脚手架 → npm install → npm build → 复制 dist
+ * @param {object} params - 构建参数
+ */
 async function buildVueComponentSandbox({ projectId, componentName, componentPath, demoPath, externalCss, projectDir, previewDir }) {
-  const record = projects.get(projectId);
-  record.status = "preparing";
+  await updateProjectStatus(projectId, "preparing");
+  const logs = [];
+
   const componentSource = await fs.readFile(componentPath, "utf8");
   const demoSource = demoPath ? await fs.readFile(demoPath, "utf8") : "";
   const sandboxOptions = analyzeVueSandbox(componentSource, demoSource, externalCss);
@@ -364,18 +808,18 @@ async function buildVueComponentSandbox({ projectId, componentName, componentPat
   if (demoPath) {
     await fs.copyFile(demoPath, path.join(projectDir, "src", "App.vue"));
     await fs.rm(demoPath, { force: true });
-    record.logs.push("Using uploaded App.vue as the component demo.");
+    logs.push("Using uploaded App.vue as the component demo.");
   } else {
     await fs.writeFile(path.join(projectDir, "src", "App.vue"), createDefaultVueDemo(componentName, componentSource), "utf8");
-    record.logs.push("Generated a default Vue demo wrapper.");
+    logs.push("Generated a default Vue demo wrapper.");
   }
 
   if (sandboxOptions.detectedDependencies.length) {
-    record.logs.push(`Detected component dependencies: ${sandboxOptions.detectedDependencies.join(", ")}`);
+    logs.push(`Detected component dependencies: ${sandboxOptions.detectedDependencies.join(", ")}`);
   }
 
   if (sandboxOptions.externalCss.length) {
-    record.logs.push(`Injected external CSS: ${sandboxOptions.externalCss.join(", ")}`);
+    logs.push(`Injected external CSS: ${sandboxOptions.externalCss.join(", ")}`);
   }
 
   await fs.writeFile(path.join(projectDir, "package.json"), createVuePackageJson(componentName, sandboxOptions.dependencies), "utf8");
@@ -385,35 +829,53 @@ async function buildVueComponentSandbox({ projectId, componentName, componentPat
   await fs.writeFile(path.join(projectDir, "vite.config.ts"), createVueViteConfig(), "utf8");
   await fs.writeFile(path.join(projectDir, "tsconfig.json"), createVueTsConfig(), "utf8");
 
-  record.sourceDir = projectDir;
-  record.rootFiles = await listRootFiles(projectDir);
-  record.scripts = { build: "vite build" };
-  record.dependencies = {
-    ...sandboxOptions.dependencies
-  };
+  const rootFiles = await listRootFiles(projectDir);
+  const scripts = { build: "vite build" };
+  const dependencies = { ...sandboxOptions.dependencies };
 
-  record.status = "installing";
-  await runCommand(getNpmCommand(), ["install"], projectDir, record);
+  await updateProjectFull(projectId, {
+    scripts,
+    dependencies,
+    rootFiles,
+    logs,
+  });
 
-  record.status = "building";
-  await runCommand(getNpmCommand(), ["run", "build", "--", "--base", "/"], projectDir, record);
+  // npm install
+  await updateProjectStatus(projectId, "installing");
+  await runCommand(getNpmCommand(), ["install"], projectDir, { logs });
+
+  // npm build
+  await updateProjectStatus(projectId, "building");
+  await runCommand(getNpmCommand(), ["run", "build", "--", "--base", "/"], projectDir, { logs });
 
   const distDir = await findBuildOutput(projectDir);
   if (!distDir) {
-    record.status = "failed";
-    record.logs.push("Build finished, but no dist output folder was found.");
+    logs.push("Build finished, but no dist output folder was found.");
+    await updateProjectFull(projectId, { status: "failed", logs });
     return;
   }
 
-  record.status = "publishing";
+  // 发布
+  await updateProjectStatus(projectId, "publishing");
   await copyDirectory(distDir, previewDir);
   await ensureSpaFallback(previewDir);
 
-  record.previewUrl = getPreviewUrl(projectId);
-  record.status = "ready";
-  record.logs.push("Published Vue component sandbox from dist.");
+  logs.push("Published Vue component sandbox from dist.");
+  await updateProjectFull(projectId, {
+    status: "ready",
+    previewUrl: getPreviewUrl(projectId),
+    logs,
+  });
 }
 
+// ──────────────────────────────────────────────
+// 预览子域名服务
+// ──────────────────────────────────────────────
+
+/**
+ * 子域名预览中间件
+ * 拦截 *.localhost 请求，匹配项目 ID 并返回静态文件
+ */
 async function servePreviewHost(req, res, next) {
   const host = req.hostname.toLowerCase();
   const match = host.match(/^([a-z0-9_-]+)\.localhost$/);
@@ -422,10 +884,15 @@ async function servePreviewHost(req, res, next) {
     return;
   }
 
-  const project = findProject(match[1]);
+  const project = await findProject(match[1]);
   const storedProjectId = project?.id || await findStoredPreviewId(match[1]);
-  if ((project && project.status !== "ready") || !storedProjectId) {
-    res.status(404).send("Preview is not ready.");
+  if (!storedProjectId) {
+    sendError(res, 404, "预览尚未准备好");
+    return;
+  }
+
+  if (project && project.status !== "ready") {
+    sendError(res, 404, "预览尚未准备好");
     return;
   }
 
@@ -438,10 +905,34 @@ async function servePreviewHost(req, res, next) {
   });
 }
 
-function findProject(id) {
-  return projects.get(id) || [...projects.values()].find((project) => project.id.toLowerCase() === id.toLowerCase());
+// ──────────────────────────────────────────────
+// 辅助函数
+// ──────────────────────────────────────────────
+
+/**
+ * 查找项目（先查 MySQL，再尝试大小写不敏感匹配）
+ * @param {string} id - 项目 ID
+ * @returns {Promise<object|null>} 项目对象或 null
+ */
+async function findProject(id) {
+  const project = await getProjectById(id);
+  if (project) return project;
+
+  // 大小写不敏感回退
+  const [rows] = await pool.execute(
+    "SELECT id FROM studio_project WHERE LOWER(id) = LOWER(?)",
+    [id]
+  );
+  if (rows.length > 0) {
+    return getProjectById(rows[0].id);
+  }
+  return null;
 }
 
+/**
+ * 生成唯一项目 ID
+ * @returns {string} 格式为 p + 10位字母数字
+ */
 function createProjectId() {
   let suffix = "";
   while (suffix.length < 10) {
@@ -450,12 +941,12 @@ function createProjectId() {
   return `p${suffix.slice(0, 10)}`;
 }
 
+/**
+ * 获取项目源码目录
+ * @param {string} projectId - 项目 ID
+ * @returns {Promise<string|null>} 源码目录路径或 null
+ */
 async function getProjectSourceDir(projectId) {
-  const project = findProject(projectId);
-  if (project?.sourceDir && await pathExists(project.sourceDir)) {
-    return project.sourceDir;
-  }
-
   const projectDir = path.join(projectsDir, projectId);
   if (!(await pathExists(projectDir))) {
     const entries = await fs.readdir(projectsDir, { withFileTypes: true }).catch(() => []);
@@ -467,6 +958,11 @@ async function getProjectSourceDir(projectId) {
   return findProjectRoot(projectDir);
 }
 
+/**
+ * 构建文件树结构
+ * @param {string} sourceDir - 源码根目录
+ * @returns {Promise<object>} 文件树对象
+ */
 async function buildFileTree(sourceDir) {
   const counter = { count: 0 };
   const children = await readTreeChildren(sourceDir, sourceDir, 0, counter);
@@ -478,6 +974,14 @@ async function buildFileTree(sourceDir) {
   };
 }
 
+/**
+ * 递归读取目录子节点（文件树构建辅助）
+ * @param {string} rootDir - 根目录
+ * @param {string} currentDir - 当前目录
+ * @param {number} depth - 当前深度
+ * @param {object} counter - 计数器（防止过多节点）
+ * @returns {Promise<object[]>} 子节点数组
+ */
 async function readTreeChildren(rootDir, currentDir, depth, counter) {
   if (depth > 8 || counter.count > 700) return [];
 
@@ -524,6 +1028,12 @@ async function readTreeChildren(rootDir, currentDir, depth, counter) {
   return nodes;
 }
 
+/**
+ * 安全解析相对路径，防止路径穿越
+ * @param {string} sourceDir - 源目录
+ * @param {string} relativePath - 相对路径
+ * @returns {string|null} 安全的绝对路径或 null
+ */
 function resolveProjectPath(sourceDir, relativePath) {
   const normalized = normalizeRelativePath(relativePath);
   if (!normalized || normalized.includes("\0")) return null;
@@ -537,10 +1047,20 @@ function resolveProjectPath(sourceDir, relativePath) {
   return absolutePath;
 }
 
+/**
+ * 规范化相对路径（统一分隔符，去除前导斜杠）
+ * @param {string} relativePath - 原始路径
+ * @returns {string} 规范化后的路径
+ */
 function normalizeRelativePath(relativePath) {
   return String(relativePath || "").replace(/\\/g, "/").replace(/^\/+/, "");
 }
 
+/**
+ * 在预览目录中查找大小写不敏感匹配的项目 ID
+ * @param {string} id - 项目 ID
+ * @returns {Promise<string|null>} 匹配到的实际目录名或 null
+ */
 async function findStoredPreviewId(id) {
   const directPath = path.join(previewsDir, id);
   if (await pathExists(directPath)) {
@@ -552,12 +1072,22 @@ async function findStoredPreviewId(id) {
   return match?.name || null;
 }
 
+/**
+ * 确保存储目录存在
+ */
 async function ensureStorage() {
   await fs.mkdir(uploadsDir, { recursive: true });
   await fs.mkdir(projectsDir, { recursive: true });
   await fs.mkdir(previewsDir, { recursive: true });
 }
 
+/**
+ * 安全解压 zip 文件
+ * 过滤 node_modules/.git 等无关目录，防止路径穿越
+ * @param {string} zipPath - zip 文件路径
+ * @param {string} destination - 解压目标目录
+ * @param {object} record - 日志记录对象
+ */
 async function extractZipSafely(zipPath, destination, record) {
   const directory = await unzipper.Open.file(zipPath);
   const skippedDirs = new Set();
@@ -598,6 +1128,11 @@ async function extractZipSafely(zipPath, destination, record) {
   }
 }
 
+/**
+ * 查找项目根目录（处理 zip 内嵌套单层目录的情况）
+ * @param {string} projectDir - 项目解压目录
+ * @returns {Promise<string>} 实际的项目根目录
+ */
 async function findProjectRoot(projectDir) {
   const entries = await fs.readdir(projectDir, { withFileTypes: true });
   const usefulEntries = entries.filter((entry) => !entry.name.startsWith("__MACOSX"));
@@ -614,6 +1149,11 @@ async function findProjectRoot(projectDir) {
   return projectDir;
 }
 
+/**
+ * 列出项目根目录的文件和文件夹
+ * @param {string} sourceDir - 源码目录
+ * @returns {Promise<object[]>} 根目录条目列表
+ */
 async function listRootFiles(sourceDir) {
   const entries = await fs.readdir(sourceDir, { withFileTypes: true });
   return entries
@@ -625,6 +1165,11 @@ async function listRootFiles(sourceDir) {
     }));
 }
 
+/**
+ * 根据 package.json 检测项目框架
+ * @param {object} packageJson - package.json 内容
+ * @returns {string} 框架名称
+ */
 function detectFramework(packageJson) {
   const deps = {
     ...packageJson.dependencies,
@@ -640,6 +1185,13 @@ function detectFramework(packageJson) {
   return "JavaScript";
 }
 
+/**
+ * 执行构建命令（npm install / npm build 等）
+ * @param {string} command - 命令
+ * @param {string[]} args - 参数
+ * @param {string} cwd - 工作目录
+ * @param {object} record - 日志记录对象
+ */
 async function runCommand(command, args, cwd, record) {
   record.logs.push(`$ ${command} ${args.join(" ")}`);
   const spawnSpec = getSpawnSpec(command, args);
@@ -679,18 +1231,33 @@ async function runCommand(command, args, cwd, record) {
   });
 }
 
+/**
+ * 将命令输出追加到日志数组
+ * @param {object} record - 含 logs 数组的对象
+ * @param {Buffer} chunk - stdout/stderr 输出
+ */
 function pushLog(record, chunk) {
-  const text = chunk.toString();
+  const text = decodeTextContent(chunk);
   for (const line of text.split(/\r?\n/)) {
     if (line.trim()) record.logs.push(line);
   }
   record.logs = record.logs.slice(-600);
 }
 
+/**
+ * 获取 npm 可执行文件名（Windows 需要 .cmd 后缀）
+ * @returns {string} npm 命令
+ */
 function getNpmCommand() {
   return process.platform === "win32" ? "npm.cmd" : "npm";
 }
 
+/**
+ * 获取 spawn 参数（Windows 需要通过 cmd.exe 执行）
+ * @param {string} command - 原始命令
+ * @param {string[]} args - 参数列表
+ * @returns {object} { command, args }
+ */
 function getSpawnSpec(command, args) {
   if (process.platform !== "win32") {
     return { command, args };
@@ -702,6 +1269,12 @@ function getSpawnSpec(command, args) {
   };
 }
 
+/**
+ * 获取构建命令参数
+ * @param {object} record - 项目记录（含 dependencies）
+ * @param {string} projectId - 项目 ID
+ * @returns {string[]} 命令参数
+ */
 function getBuildArgs(record, projectId) {
   if (record.dependencies?.vite) {
     return ["run", "build", "--", "--base", "/"];
@@ -710,10 +1283,28 @@ function getBuildArgs(record, projectId) {
   return ["run", "build"];
 }
 
+/**
+ * 预览 URL 模板，可通过环境变量覆盖
+ * 默认: http://<projectId>.localhost:<port>/
+ * 生产: https://<projectId>.preview.xander-lab.dsircity.top/
+ */
+const previewUrlPattern = process.env.PREVIEW_URL_PATTERN
+  || `http://<projectId>.localhost:${port}/`;
+
+/**
+ * 根据项目 ID 生成预览 URL
+ * @param {string} projectId - 项目唯一标识
+ * @returns {string} 完整的预览地址
+ */
 function getPreviewUrl(projectId) {
-  return `http://${projectId.toLowerCase()}.localhost:${port}/`;
+  return previewUrlPattern.replace(/<projectId>/g, projectId.toLowerCase());
 }
 
+/**
+ * 将字符串转为 PascalCase
+ * @param {string} value - 原始字符串
+ * @returns {string} PascalCase 结果
+ */
 function toPascalCase(value) {
   return value
     .replace(/[^a-zA-Z0-9]+/g, " ")
@@ -724,6 +1315,11 @@ function toPascalCase(value) {
     .join("");
 }
 
+/**
+ * HTML 实体转义
+ * @param {string} value - 原始字符串
+ * @returns {string} 转义后的安全字符串
+ */
 function escapeHtml(value) {
   return String(value)
     .replaceAll("&", "&amp;")
@@ -733,6 +1329,13 @@ function escapeHtml(value) {
     .replaceAll("'", "&#039;");
 }
 
+/**
+ * 分析 Vue 组件源码，提取依赖和配置
+ * @param {string} componentSource - 组件源码
+ * @param {string} demoSource - demo 源码
+ * @param {string} externalCssInput - 外部 CSS
+ * @returns {object} 沙箱配置
+ */
 function analyzeVueSandbox(componentSource, demoSource, externalCssInput = "") {
   const source = `${componentSource}\n${demoSource}`;
   const dependencies = {
@@ -775,6 +1378,11 @@ function analyzeVueSandbox(componentSource, demoSource, externalCssInput = "") {
   };
 }
 
+/**
+ * 规范化外部 CSS 链接列表
+ * @param {string} input - 原始输入
+ * @returns {string[]} 有效的 CSS URL 数组
+ */
 function normalizeExternalCss(input) {
   return String(input || "")
     .split(/[\n,]+/)
@@ -791,10 +1399,20 @@ function normalizeExternalCss(input) {
     .slice(0, 8);
 }
 
+/**
+ * 检测源码中是否使用了 Font Awesome
+ * @param {string} source - 源码
+ * @returns {boolean}
+ */
 function usesFontAwesome(source) {
   return /\b(?:fa|fas|far|fab|fal|fad|fa-solid|fa-regular|fa-brands)\b/.test(source);
 }
 
+/**
+ * 从源码中提取裸模块 import
+ * @param {string} source - 源码
+ * @returns {Set<string>} 模块名集合
+ */
 function extractBareImports(source) {
   const imports = new Set();
   const importPattern = /(?:import|export)\s+(?:[^'"]*?\s+from\s+)?['"]([^'"]+)['"]|import\(\s*['"]([^'"]+)['"]\s*\)/g;
@@ -813,6 +1431,12 @@ function extractBareImports(source) {
   return imports;
 }
 
+/**
+ * 生成 Vue 沙箱的 package.json
+ * @param {string} componentName - 组件名
+ * @param {object} dependencies - 依赖
+ * @returns {string} JSON 字符串
+ */
 function createVuePackageJson(componentName, dependencies) {
   return `${JSON.stringify({
     name: `${componentName.replace(/[A-Z]/g, (letter, index) => `${index ? "-" : ""}${letter.toLowerCase()}`)}-sandbox`,
@@ -826,6 +1450,12 @@ function createVuePackageJson(componentName, dependencies) {
   }, null, 2)}\n`;
 }
 
+/**
+ * 生成 Vue 沙箱的 index.html
+ * @param {string} componentName - 组件名
+ * @param {object} options - 沙箱配置
+ * @returns {string} HTML 字符串
+ */
 function createVueIndexHtml(componentName, options) {
   const cssLinks = options.externalCss
     .map((href) => `    <link rel="stylesheet" href="${escapeHtml(href)}" />`)
@@ -847,6 +1477,11 @@ ${maybeCssLinks}  </head>
 `;
 }
 
+/**
+ * 生成 Vue 沙箱的 main.ts 入口文件
+ * @param {object} options - 沙箱配置
+ * @returns {string} TypeScript 源码
+ */
 function createVueMainTs(options) {
   if (options.needsRouter) {
     return `import { createApp } from 'vue'
@@ -881,6 +1516,12 @@ createApp(App)
 `;
 }
 
+/**
+ * 生成默认 Vue 组件 demo 包装器
+ * @param {string} componentName - 组件名
+ * @param {string} componentSource - 组件源码
+ * @returns {string} Vue SFC 源码
+ */
 function createDefaultVueDemo(componentName, componentSource) {
   const componentProps = createDefaultVueComponentProps(componentSource);
   const componentAttrs = componentProps.length
@@ -947,6 +1588,11 @@ h1 {
 `;
 }
 
+/**
+ * 根据组件源码推断默认 props
+ * @param {string} componentSource - 组件源码
+ * @returns {string[]} props 属性字符串数组
+ */
 function createDefaultVueComponentProps(componentSource) {
   const props = [];
 
@@ -973,14 +1619,30 @@ function createDefaultVueComponentProps(componentSource) {
   return props;
 }
 
+/**
+ * 检查组件是否声明了某个 prop
+ * @param {string} source - 组件源码
+ * @param {string} propName - prop 名称
+ * @returns {boolean}
+ */
 function hasProp(source, propName) {
   return new RegExp(`\\b${propName}\\s*:`, "m").test(source);
 }
 
+/**
+ * 检查组件是否声明了某个 required prop
+ * @param {string} source - 组件源码
+ * @param {string} propName - prop 名称
+ * @returns {boolean}
+ */
 function hasRequiredProp(source, propName) {
   return new RegExp(`\\b${propName}\\s*:\\s*\\{[\\s\\S]*?required\\s*:\\s*true`, "m").test(source);
 }
 
+/**
+ * 生成 Vue 预览页的基础 CSS
+ * @returns {string} CSS 内容
+ */
 function createVuePreviewCss() {
   return `:root {
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -998,6 +1660,10 @@ body {
 `;
 }
 
+/**
+ * 生成 Vite 配置
+ * @returns {string} vite.config.ts 内容
+ */
 function createVueViteConfig() {
   return `import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
@@ -1008,6 +1674,10 @@ export default defineConfig({
 `;
 }
 
+/**
+ * 生成 TypeScript 配置
+ * @returns {string} tsconfig.json 内容
+ */
 function createVueTsConfig() {
   return `${JSON.stringify({
     compilerOptions: {
@@ -1028,6 +1698,11 @@ function createVueTsConfig() {
   }, null, 2)}\n`;
 }
 
+/**
+ * 查找构建输出目录（dist/build/out/public/.output/public）
+ * @param {string} sourceDir - 源码目录
+ * @returns {Promise<string|null>} 构建输出目录路径或 null
+ */
 async function findBuildOutput(sourceDir) {
   const candidates = [
     "dist",
@@ -1047,6 +1722,11 @@ async function findBuildOutput(sourceDir) {
   return null;
 }
 
+/**
+ * 复制静态项目到预览目录
+ * @param {string} sourceDir - 源目录
+ * @param {string} previewDir - 预览目录
+ */
 async function copyStaticProject(sourceDir, previewDir) {
   if (!(await pathExists(path.join(sourceDir, "index.html")))) {
     throw new Error("Static project must contain index.html at its root.");
@@ -1054,6 +1734,10 @@ async function copyStaticProject(sourceDir, previewDir) {
   await copyDirectory(sourceDir, previewDir, ignoredArchiveDirs);
 }
 
+/**
+ * 确保 SPA 回退入口存在
+ * @param {string} previewDir - 预览目录
+ */
 async function ensureSpaFallback(previewDir) {
   const indexPath = path.join(previewDir, "index.html");
   if (!(await pathExists(indexPath))) {
@@ -1061,6 +1745,12 @@ async function ensureSpaFallback(previewDir) {
   }
 }
 
+/**
+ * 递归复制目录
+ * @param {string} source - 源目录
+ * @param {string} destination - 目标目录
+ * @param {Set<string>} ignoredNames - 忽略的目录名
+ */
 async function copyDirectory(source, destination, ignoredNames = new Set()) {
   await fs.mkdir(destination, { recursive: true });
   const entries = await fs.readdir(source, { withFileTypes: true });
@@ -1079,6 +1769,11 @@ async function copyDirectory(source, destination, ignoredNames = new Set()) {
   }
 }
 
+/**
+ * 检查路径是否存在
+ * @param {string} targetPath - 目标路径
+ * @returns {Promise<boolean>}
+ */
 async function pathExists(targetPath) {
   try {
     await fs.access(targetPath);
