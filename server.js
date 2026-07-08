@@ -17,7 +17,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-const port = Number(process.env.PORT || 3010);
+const port = Number(process.env.PORT || 30003);
 
 const storageRoot = path.join(__dirname, "storage");
 const uploadsDir = path.join(storageRoot, "uploads");
@@ -361,26 +361,27 @@ function sendError(res, code, message) {
 
 app.use(express.json());
 app.use(requestLogger);
-app.use(servePreviewHost);
-app.use("/", express.static(path.join(__dirname, "public")));
+app.get("/health", (_req, res) => {
+  res.json({ ok: true });
+});
 
 /**
- * GET /api/projects - 获取当前用户的所有项目
+ * GET /studio-api/projects - 获取当前用户的所有项目
  */
-app.get("/api/projects", authMiddleware, async (req, res) => {
+app.get("/studio-api/projects", authMiddleware, async (req, res) => {
   try {
     const projects = await getProjectsByUserId(req.userId);
     res.json({ projects });
   } catch (error) {
-    console.error("[GET /api/projects]", error.message);
+    console.error("[GET /studio-api/projects]", error.message);
     sendError(res, 500, "加载项目失败");
   }
 });
 
 /**
- * GET /api/projects/:id - 获取单个项目详情
+ * GET /studio-api/projects/:id - 获取单个项目详情
  */
-app.get("/api/projects/:id", authMiddleware, async (req, res) => {
+app.get("/studio-api/projects/:id", authMiddleware, async (req, res) => {
   try {
     const project = await findProject(req.params.id);
     if (!project || project.userId !== req.userId) {
@@ -389,15 +390,15 @@ app.get("/api/projects/:id", authMiddleware, async (req, res) => {
     }
     res.json({ project });
   } catch (error) {
-    console.error("[GET /api/projects/:id]", error.message);
+    console.error("[GET /studio-api/projects/:id]", error.message);
     sendError(res, 500, "加载项目失败");
   }
 });
 
 /**
- * GET /api/projects/:id/files - 获取项目文件树
+ * GET /studio-api/projects/:id/files - 获取项目文件树
  */
-app.get("/api/projects/:id/files", authMiddleware, async (req, res) => {
+app.get("/studio-api/projects/:id/files", authMiddleware, async (req, res) => {
   try {
     const project = await findProject(req.params.id);
     if (!project || project.userId !== req.userId) {
@@ -419,9 +420,9 @@ app.get("/api/projects/:id/files", authMiddleware, async (req, res) => {
 });
 
 /**
- * GET /api/projects/:id/files/content - 获取项目文件内容
+ * GET /studio-api/projects/:id/files/content - 获取项目文件内容
  */
-app.get("/api/projects/:id/files/content", authMiddleware, async (req, res) => {
+app.get("/studio-api/projects/:id/files/content", authMiddleware, async (req, res) => {
   try {
     const project = await findProject(req.params.id);
     if (!project || project.userId !== req.userId) {
@@ -473,9 +474,9 @@ app.get("/api/projects/:id/files/content", authMiddleware, async (req, res) => {
 });
 
 /**
- * POST /api/projects/upload - 上传 zip 项目
+ * POST /studio-api/projects/upload - 上传 zip 项目
  */
-app.post("/api/projects/upload", authMiddleware, uploadProject, async (req, res) => {
+app.post("/studio-api/projects/upload", authMiddleware, uploadProject, async (req, res) => {
   if (!req.file) {
     sendError(res, 400, "请上传 zip 文件");
     return;
@@ -535,9 +536,9 @@ app.post("/api/projects/upload", authMiddleware, uploadProject, async (req, res)
 });
 
 /**
- * POST /api/components/vue/upload - 上传 Vue 组件
+ * POST /studio-api/components/vue/upload - 上传 Vue 组件
  */
-app.post("/api/components/vue/upload", authMiddleware, uploadVueComponent, async (req, res) => {
+app.post("/studio-api/components/vue/upload", authMiddleware, uploadVueComponent, async (req, res) => {
   const componentFile = req.files?.component?.[0];
   const demoFile = req.files?.demo?.[0];
 
@@ -647,9 +648,9 @@ function uploadVueComponent(req, res, next) {
 // ──────────────────────────────────────────────
 
 /**
- * /preview/:projectId 路径预览（带路径前缀）
+ * /studio-preview/:projectId 路径预览（带路径前缀）
  */
-app.use("/preview/:projectId", async (req, res, next) => {
+app.use("/studio-preview/:projectId", async (req, res, next) => {
   const project = await findProject(req.params.projectId);
   const storedProjectId = project?.id || await findStoredPreviewId(req.params.projectId);
   if (!storedProjectId) {
@@ -846,7 +847,7 @@ async function buildVueComponentSandbox({ projectId, componentName, componentPat
 
   // npm build
   await updateProjectStatus(projectId, "building");
-  await runCommand(getNpmCommand(), ["run", "build", "--", "--base", "/"], projectDir, { logs });
+  await runCommand(getNpmCommand(), ["run", "build", "--", "--base", getPreviewAssetBase(projectId)], projectDir, { logs });
 
   const distDir = await findBuildOutput(projectDir);
   if (!distDir) {
@@ -1277,7 +1278,7 @@ function getSpawnSpec(command, args) {
  */
 function getBuildArgs(record, projectId) {
   if (record.dependencies?.vite) {
-    return ["run", "build", "--", "--base", "/"];
+    return ["run", "build", "--", "--base", getPreviewAssetBase(projectId)];
   }
 
   return ["run", "build"];
@@ -1285,11 +1286,11 @@ function getBuildArgs(record, projectId) {
 
 /**
  * 预览 URL 模板，可通过环境变量覆盖
- * 默认: http://<projectId>.localhost:<port>/
- * 生产: https://<projectId>.preview.xander-lab.dsircity.top/
+ * 默认: http://localhost:<port>/studio-preview/<projectId>
+ * 生产: https://xander-lab.dsircity.top/api/studio-preview/<projectId>
  */
 const previewUrlPattern = process.env.PREVIEW_URL_PATTERN
-  || `http://<projectId>.localhost:${port}/`;
+  || `http://localhost:${port}/studio-preview/<projectId>`;
 
 /**
  * 根据项目 ID 生成预览 URL
@@ -1298,6 +1299,15 @@ const previewUrlPattern = process.env.PREVIEW_URL_PATTERN
  */
 function getPreviewUrl(projectId) {
   return previewUrlPattern.replace(/<projectId>/g, projectId.toLowerCase());
+}
+
+function getPreviewAssetBase(projectId) {
+  try {
+    const previewUrl = new URL(getPreviewUrl(projectId));
+    return previewUrl.pathname.endsWith("/") ? previewUrl.pathname : `${previewUrl.pathname}/`;
+  } catch {
+    return `/studio-preview/${projectId.toLowerCase()}/`;
+  }
 }
 
 /**

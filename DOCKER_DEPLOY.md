@@ -1,46 +1,71 @@
-# Docker 部署说明
+# Docker deployment
 
-## 1. 准备环境变量
+`frontend-share-sandbox` is deployed as a backend-only service for the xander-lab stack.
+
+## Runtime
+
+- Container and host port: `127.0.0.1:30003:30003`
+- Public API prefix after xander-lab-frontend baseURL `/api`: `/studio-api`
+- Public preview prefix after xander-lab-frontend baseURL `/api`: `/studio-preview`
+- Shared MySQL: host server MySQL, database `xander_lab`
+- Shared Redis: existing `relationship-redis` container on external Docker network `xander-network`
+
+## Environment
 
 ```bash
 cp .env.example .env
 vim .env
 ```
 
-至少确认这些值：
+Required values:
 
-- `MYSQL_HOST` / `MYSQL_PORT` / `MYSQL_USER` / `MYSQL_PASSWORD` / `MYSQL_DATABASE`
-- `REDIS_HOST` / `REDIS_PORT`
-- `JWT_SECRET`：必须与 Java 后端一致
-- `PREVIEW_URL_PATTERN`：生产环境建议改成真实预览域名
+- `MYSQL_HOST=host.docker.internal`
+- `MYSQL_PORT=3306`
+- `MYSQL_USER`
+- `MYSQL_PASSWORD`
+- `MYSQL_DATABASE=xander_lab`
+- `REDIS_HOST=relationship-redis`
+- `REDIS_PORT=6379`
+- `JWT_SECRET`, matching `xander-lab-backend`
+- `PREVIEW_URL_PATTERN=https://xander-lab.dsircity.top/api/studio-preview/<projectId>`
 
-如果 Redis 安装在服务器宿主机上，`.env.example` 中的 `REDIS_HOST=host.docker.internal` 可以配合 `docker-compose.yml` 的 `extra_hosts` 使用。
+Before first deployment, apply `db/schema.sql` to the shared `xander_lab` database.
 
-## 2. 启动服务
+## Start
 
 ```bash
 bash scripts/deploy.sh
 ```
 
-等价命令：
+Equivalent command:
 
 ```bash
 docker compose -p frontend-share-sandbox up -d --build
 ```
 
-服务名、容器名、镜像名：
+## Nginx
 
-- Compose 项目名：`frontend-share-sandbox`
-- 容器名：`frontend-share-sandbox`
-- 镜像名：`frontend-share-sandbox:latest`
+Place these locations before the general `/api/` location:
 
-端口映射：
+```nginx
+location ^~ /api/studio-api/ {
+    proxy_pass http://127.0.0.1:30003/studio-api/;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
 
-```text
-30001:30001
+location ^~ /api/studio-preview/ {
+    proxy_pass http://127.0.0.1:30003/studio-preview/;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
 ```
 
-## 3. 常用运维命令
+## Operations
 
 ```bash
 docker compose -p frontend-share-sandbox ps
@@ -49,7 +74,7 @@ docker compose -p frontend-share-sandbox restart
 docker compose -p frontend-share-sandbox down
 ```
 
-`storage` 目录使用 Docker volume 持久化：
+Persistent storage:
 
 ```text
 frontend-share-sandbox-storage -> /app/storage

@@ -10,14 +10,20 @@ services:
       - .env
     environment:
       NODE_ENV: production
-      PORT: 30001
+      PORT: 30003
     ports:
-      - "30001:30001"
+      - "127.0.0.1:30003:30003"
     volumes:
       - frontend-share-sandbox-storage:/app/storage
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    networks:
+      - xander-network
 
 volumes:
   frontend-share-sandbox-storage:
     name: frontend-share-sandbox-storage
+
+networks:
+  xander-network:
+    external: true
