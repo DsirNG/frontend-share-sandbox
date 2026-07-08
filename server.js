@@ -1195,12 +1195,11 @@ function detectFramework(packageJson) {
  */
 async function runCommand(command, args, cwd, record) {
   record.logs.push(`$ ${command} ${args.join(" ")}`);
-  const spawnSpec = getSpawnSpec(command, args);
 
   await new Promise((resolve, reject) => {
-    const child = spawn(spawnSpec.command, spawnSpec.args, {
+    const child = spawn(command, args, {
       cwd,
-      shell: false,
+      shell: true,
       env: {
         ...process.env,
         CI: "true",
