@@ -6,7 +6,7 @@
 
 - Container and host port: `127.0.0.1:30003:30003`
 - Public API prefix after xander-lab-frontend baseURL `/api`: `/studio-api`
-- Public preview prefix after xander-lab-frontend baseURL `/api`: `/studio-preview`
+- Public preview host pattern: `<projectId>.preview.xander-lab.dsircity.top`
 - Shared MySQL: host server MySQL, database `xander_lab`
 - Shared Redis: existing `relationship-redis` container on external Docker network `xander-network`
 
@@ -27,7 +27,7 @@ Required values:
 - `REDIS_HOST=relationship-redis`
 - `REDIS_PORT=6379`
 - `JWT_SECRET`, matching `xander-lab-backend`
-- `PREVIEW_URL_PATTERN=https://xander-lab.dsircity.top/api/studio-preview/<projectId>`
+- `PREVIEW_URL_PATTERN=https://<projectId>.preview.xander-lab.dsircity.top/`
 
 Before first deployment, apply `db/schema.sql` to the shared `xander_lab` database.
 
@@ -45,7 +45,7 @@ docker compose -p frontend-share-sandbox up -d --build
 
 ## Nginx
 
-Place these locations before the general `/api/` location:
+Place this location before the general `/api/` location on `xander-lab.dsircity.top`:
 
 ```nginx
 location ^~ /api/studio-api/ {
@@ -55,15 +55,26 @@ location ^~ /api/studio-api/ {
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto $scheme;
 }
+```
 
-location ^~ /api/studio-preview/ {
-    proxy_pass http://127.0.0.1:30003/studio-preview/;
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto $scheme;
+Preview pages are served from wildcard subdomains:
+
+```nginx
+server {
+    listen 443 ssl http2;
+    server_name *.preview.xander-lab.dsircity.top;
+
+    location / {
+        proxy_pass http://127.0.0.1:30003;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
 }
 ```
+
+The wildcard DNS record and TLS certificate must both cover `*.preview.xander-lab.dsircity.top`.
 
 ## Operations
 

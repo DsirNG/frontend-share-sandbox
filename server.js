@@ -663,12 +663,16 @@ function uploadVueComponent(req, res, next) {
 // 预览服务
 // ──────────────────────────────────────────────
 
-/**
- * /studio-preview/:projectId 路径预览（带路径前缀）
- */
-app.use("/studio-preview/:projectId", async (req, res, next) => {
-  const project = await findProject(req.params.projectId);
-  const storedProjectId = project?.id || await findStoredPreviewId(req.params.projectId);
+// Preview is served only from the configured project subdomain.
+app.use(async (req, res, next) => {
+  const projectId = getPreviewProjectIdFromHost(req);
+  if (!projectId) {
+    next();
+    return;
+  }
+
+  const project = await findProject(projectId);
+  const storedProjectId = project?.id || await findStoredPreviewId(projectId);
   if (!storedProjectId) {
     sendError(res, 404, "预览尚未准备好");
     return;
@@ -1372,11 +1376,11 @@ function getBuildArgs(record, projectId) {
 
 /**
  * 预览 URL 模板，可通过环境变量覆盖
- * 默认: http://localhost:<port>/studio-preview/<projectId>
- * 生产: https://xander-lab.dsircity.top/api/studio-preview/<projectId>
+ * 默认: http://<projectId>.localhost:<port>/
+ * 生产: https://<projectId>.preview.xander-lab.dsircity.top/
  */
 const previewUrlPattern = process.env.PREVIEW_URL_PATTERN
-  || `http://localhost:${port}/studio-preview/<projectId>`;
+  || `http://<projectId>.localhost:${port}/`;
 
 /**
  * 根据项目 ID 生成预览 URL
@@ -1392,7 +1396,29 @@ function getPreviewAssetBase(projectId) {
     const previewUrl = new URL(getPreviewUrl(projectId));
     return previewUrl.pathname.endsWith("/") ? previewUrl.pathname : `${previewUrl.pathname}/`;
   } catch {
-    return `/studio-preview/${projectId.toLowerCase()}/`;
+    return "/";
+  }
+}
+
+function getPreviewProjectIdFromHost(req) {
+  let host = req.hostname || req.headers.host || "";
+  host = host.split(":")[0].toLowerCase();
+  if (!host) return null;
+
+  try {
+    const marker = "preview-project-id";
+    const patternHost = new URL(getPreviewUrl(marker)).hostname.toLowerCase();
+    const markerIndex = patternHost.indexOf(marker);
+    if (markerIndex < 0) return null;
+
+    const prefix = patternHost.slice(0, markerIndex);
+    const suffix = patternHost.slice(markerIndex + marker.length);
+    if (!host.startsWith(prefix) || !host.endsWith(suffix)) return null;
+
+    const projectId = host.slice(prefix.length, host.length - suffix.length);
+    return /^[a-z0-9-]+$/.test(projectId) ? projectId : null;
+  } catch {
+    return null;
   }
 }
 
