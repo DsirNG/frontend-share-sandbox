@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import { createWriteStream } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawn } from "node:child_process";
+import { spawn, execSync } from "node:child_process";
 import express from "express";
 import multer from "multer";
 import unzipper from "unzipper";
@@ -522,7 +522,10 @@ app.post("/studio-api/projects/upload", authMiddleware, uploadProject, async (re
 
     // 异步构建
     buildUploadedProject({ projectId, uploadPath, projectDir, previewDir }).catch(async (error) => {
-      await updateProjectFull(projectId, { status: "failed", logs: [`Fatal error: ${error.message}`] });
+      const existing = await getProjectById(projectId);
+      const existingLogs = Array.isArray(existing?.logs) ? [...existing.logs] : [];
+      existingLogs.push(`Fatal error: ${error.message}`);
+      await updateProjectFull(projectId, { status: "failed", logs: existingLogs });
     });
 
     // 清理超出限额的旧项目
@@ -592,7 +595,10 @@ app.post("/studio-api/components/vue/upload", authMiddleware, uploadVueComponent
       projectDir,
       previewDir
     }).catch(async (error) => {
-      await updateProjectFull(projectId, { status: "failed", logs: [`Fatal error: ${error.message}`] });
+      const existing = await getProjectById(projectId);
+      const existingLogs = Array.isArray(existing?.logs) ? [...existing.logs] : [];
+      existingLogs.push(`Fatal error: ${error.message}`);
+      await updateProjectFull(projectId, { status: "failed", logs: existingLogs });
     });
 
     cleanupOldProjects(req.userId).catch((err) => {
@@ -1250,7 +1256,6 @@ function pushLog(record, chunk) {
  * @returns {string} 包管理器命令
  */
 function getPackageManager() {
-  const { execSync } = require("child_process");
   const isWin = process.platform === "win32";
 
   const managers = isWin ? ["pnpm.cmd", "npm.cmd", "yarn.cmd"] : ["pnpm", "npm", "yarn"];
