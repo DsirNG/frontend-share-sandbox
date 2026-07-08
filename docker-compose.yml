@@ -1,0 +1,23 @@
+services:
+  frontend-share-sandbox:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: frontend-share-sandbox:latest
+    container_name: frontend-share-sandbox
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      PORT: 30001
+    ports:
+      - "30001:30001"
+    volumes:
+      - frontend-share-sandbox-storage:/app/storage
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  frontend-share-sandbox-storage:
+    name: frontend-share-sandbox-storage
