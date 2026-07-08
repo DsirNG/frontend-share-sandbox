@@ -233,6 +233,17 @@ function camelToSnake(str) {
 // ──────────────────────────────────────────────
 
 /**
+ * 消费请求体（用于在返回错误响应前清空请求流）
+ * 防止大文件上传时提前返回响应导致代理连接异常
+ * @param {object} req - Express request 对象
+ */
+function drainRequest(req) {
+  req.resume();
+  req.on("end", () => {});
+  req.on("error", () => {});
+}
+
+/**
  * JWT 鉴权中间件
  * 验证 token 签名 + 检查 Redis 中 token 是否仍活跃
  * 通过后设置 req.userId
@@ -240,6 +251,7 @@ function camelToSnake(str) {
 async function authMiddleware(req, res, next) {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    drainRequest(req);
     sendError(res, 401, "未登录或登录已过期");
     return;
   }
@@ -250,12 +262,14 @@ async function authMiddleware(req, res, next) {
     // 检查 Redis 中 token 是否仍存在（与 Java 后端逻辑一致）
     const redisValue = await redis.get(REDIS_TOKEN_PREFIX + token);
     if (!redisValue) {
+      drainRequest(req);
       sendError(res, 401, "未登录或登录已过期");
       return;
     }
     req.userId = Number(decoded.sub || redisValue);
     next();
   } catch (err) {
+    drainRequest(req);
     sendError(res, 401, "未登录或登录已过期");
   }
 }
