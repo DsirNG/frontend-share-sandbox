@@ -366,22 +366,22 @@ app.get("/health", (_req, res) => {
 });
 
 /**
- * GET /studio-api/projects - 获取当前用户的所有项目
+ * GET /api/projects - 获取当前用户的所有项目
  */
-app.get("/studio-api/projects", authMiddleware, async (req, res) => {
+app.get("/api/projects", authMiddleware, async (req, res) => {
   try {
     const projects = await getProjectsByUserId(req.userId);
     res.json({ projects });
   } catch (error) {
-    console.error("[GET /studio-api/projects]", error.message);
+    console.error("[GET /api/projects]", error.message);
     sendError(res, 500, "加载项目失败");
   }
 });
 
 /**
- * GET /studio-api/projects/:id - 获取单个项目详情
+ * GET /api/projects/:id - 获取单个项目详情
  */
-app.get("/studio-api/projects/:id", authMiddleware, async (req, res) => {
+app.get("/api/projects/:id", authMiddleware, async (req, res) => {
   try {
     const project = await findProject(req.params.id);
     if (!project || project.userId !== req.userId) {
@@ -390,15 +390,15 @@ app.get("/studio-api/projects/:id", authMiddleware, async (req, res) => {
     }
     res.json({ project });
   } catch (error) {
-    console.error("[GET /studio-api/projects/:id]", error.message);
+    console.error("[GET /api/projects/:id]", error.message);
     sendError(res, 500, "加载项目失败");
   }
 });
 
 /**
- * GET /studio-api/projects/:id/files - 获取项目文件树
+ * GET /api/projects/:id/files - 获取项目文件树
  */
-app.get("/studio-api/projects/:id/files", authMiddleware, async (req, res) => {
+app.get("/api/projects/:id/files", authMiddleware, async (req, res) => {
   try {
     const project = await findProject(req.params.id);
     if (!project || project.userId !== req.userId) {
@@ -420,9 +420,9 @@ app.get("/studio-api/projects/:id/files", authMiddleware, async (req, res) => {
 });
 
 /**
- * GET /studio-api/projects/:id/files/content - 获取项目文件内容
+ * GET /api/projects/:id/files/content - 获取项目文件内容
  */
-app.get("/studio-api/projects/:id/files/content", authMiddleware, async (req, res) => {
+app.get("/api/projects/:id/files/content", authMiddleware, async (req, res) => {
   try {
     const project = await findProject(req.params.id);
     if (!project || project.userId !== req.userId) {
@@ -474,9 +474,9 @@ app.get("/studio-api/projects/:id/files/content", authMiddleware, async (req, re
 });
 
 /**
- * POST /studio-api/projects/upload - 上传 zip 项目
+ * POST /api/projects/upload - 上传 zip 项目
  */
-app.post("/studio-api/projects/upload", authMiddleware, uploadProject, async (req, res) => {
+app.post("/api/projects/upload", authMiddleware, uploadProject, async (req, res) => {
   if (!req.file) {
     sendError(res, 400, "请上传 zip 文件");
     return;
@@ -536,9 +536,9 @@ app.post("/studio-api/projects/upload", authMiddleware, uploadProject, async (re
 });
 
 /**
- * POST /studio-api/components/vue/upload - 上传 Vue 组件
+ * POST /api/components/vue/upload - 上传 Vue 组件
  */
-app.post("/studio-api/components/vue/upload", authMiddleware, uploadVueComponent, async (req, res) => {
+app.post("/api/components/vue/upload", authMiddleware, uploadVueComponent, async (req, res) => {
   const componentFile = req.files?.component?.[0];
   const demoFile = req.files?.demo?.[0];
 
