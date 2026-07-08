@@ -1,6 +1,6 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
-import { createWriteStream } from "node:fs";
+import { createWriteStream, existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, execSync } from "node:child_process";
@@ -155,6 +155,18 @@ async function updateProjectFull(id, fields) {
   if (sets.length === 0) return;
   values.push(id);
   await pool.execute(`UPDATE studio_project SET ${sets.join(", ")} WHERE id = ?`, values);
+}
+
+async function markProjectBuildFailed(projectId, error) {
+  const existing = await getProjectById(projectId);
+  const logs = Array.isArray(existing?.logs) ? [...existing.logs] : [];
+  const fatalLine = `Fatal error: ${error.message}`;
+
+  if (logs[logs.length - 1] !== fatalLine) {
+    logs.push(fatalLine);
+  }
+
+  await updateProjectFull(projectId, { status: "failed", logs });
 }
 
 /**
@@ -521,11 +533,10 @@ app.post("/studio-api/projects/upload", authMiddleware, uploadProject, async (re
     res.status(202).json({ project: record });
 
     // 异步构建
-    buildUploadedProject({ projectId, uploadPath, projectDir, previewDir }).catch(async (error) => {
-      const existing = await getProjectById(projectId);
-      const existingLogs = Array.isArray(existing?.logs) ? [...existing.logs] : [];
-      existingLogs.push(`Fatal error: ${error.message}`);
-      await updateProjectFull(projectId, { status: "failed", logs: existingLogs });
+    buildUploadedProject({ projectId, uploadPath, projectDir, previewDir }).catch((error) => {
+      markProjectBuildFailed(projectId, error).catch((err) => {
+        console.error("[Build Failure]", err.message);
+      });
     });
 
     // 清理超出限额的旧项目
@@ -594,11 +605,10 @@ app.post("/studio-api/components/vue/upload", authMiddleware, uploadVueComponent
       externalCss: req.body.externalCss,
       projectDir,
       previewDir
-    }).catch(async (error) => {
-      const existing = await getProjectById(projectId);
-      const existingLogs = Array.isArray(existing?.logs) ? [...existing.logs] : [];
-      existingLogs.push(`Fatal error: ${error.message}`);
-      await updateProjectFull(projectId, { status: "failed", logs: existingLogs });
+    }).catch((error) => {
+      markProjectBuildFailed(projectId, error).catch((err) => {
+        console.error("[Vue Build Failure]", err.message);
+      });
     });
 
     cleanupOldProjects(req.userId).catch((err) => {
@@ -764,12 +774,13 @@ async function buildUploadedProject({ projectId, uploadPath, projectDir, preview
 
   // npm install
   await updateProjectStatus(projectId, "installing");
-  await runCommand(getPackageManager(), ["install"], sourceDir, { logs });
+  const packageManager = getPackageManager(sourceDir);
+  await runCommand(packageManager, getInstallArgs(packageManager), sourceDir, { logs, projectId });
 
   // npm build
   await updateProjectStatus(projectId, "building");
   const buildRecord = { dependencies, logs };
-  await runCommand(getPackageManager(), getBuildArgs(buildRecord, projectId), sourceDir, { logs });
+  await runCommand(packageManager, getBuildArgs(buildRecord, projectId), sourceDir, { logs, projectId });
 
   const distDir = await findBuildOutput(sourceDir);
   if (!distDir) {
@@ -849,11 +860,12 @@ async function buildVueComponentSandbox({ projectId, componentName, componentPat
 
   // npm install
   await updateProjectStatus(projectId, "installing");
-  await runCommand(getPackageManager(), ["install"], projectDir, { logs });
+  const packageManager = getPackageManager(projectDir);
+  await runCommand(packageManager, getInstallArgs(packageManager), projectDir, { logs, projectId });
 
   // npm build
   await updateProjectStatus(projectId, "building");
-  await runCommand(getPackageManager(), ["run", "build", "--", "--base", getPreviewAssetBase(projectId)], projectDir, { logs });
+  await runCommand(packageManager, ["run", "build", "--", "--base", getPreviewAssetBase(projectId)], projectDir, { logs, projectId });
 
   const distDir = await findBuildOutput(projectDir);
   if (!distDir) {
@@ -1200,7 +1212,8 @@ function detectFramework(packageJson) {
  * @param {object} record - 日志记录对象
  */
 async function runCommand(command, args, cwd, record) {
-  record.logs.push(`$ ${command} ${args.join(" ")}`);
+  const displayCommand = `${command} ${args.join(" ")}`.trim();
+  record.logs.push(`$ ${displayCommand}`);
 
   await new Promise((resolve, reject) => {
     const child = spawn(command, args, {
@@ -1215,15 +1228,18 @@ async function runCommand(command, args, cwd, record) {
     });
 
     const timeout = setTimeout(() => {
+      const message = `Command timed out after 180 seconds: ${displayCommand}`;
+      record.logs.push(message);
       child.kill("SIGTERM");
-      reject(new Error("Command timed out after 180 seconds."));
+      persistCommandLogs(record).finally(() => reject(new Error(message)));
     }, 180_000);
 
     child.stdout.on("data", (chunk) => pushLog(record, chunk));
     child.stderr.on("data", (chunk) => pushLog(record, chunk));
     child.on("error", (error) => {
       clearTimeout(timeout);
-      reject(error);
+      record.logs.push(`Command failed to start: ${error.message}`);
+      persistCommandLogs(record).finally(() => reject(error));
     });
     child.on("exit", (code) => {
       clearTimeout(timeout);
@@ -1232,9 +1248,23 @@ async function runCommand(command, args, cwd, record) {
         return;
       }
 
-      reject(new Error(`Command failed with exit code ${code}.`));
+      const message = code === 127
+        ? `Command failed with exit code 127 while running "${displayCommand}". A command was not found in PATH or a build dependency was not installed.`
+        : `Command failed with exit code ${code}.`;
+      record.logs.push(message);
+      persistCommandLogs(record).finally(() => reject(new Error(message)));
     });
   });
+}
+
+async function persistCommandLogs(record) {
+  if (!record.projectId) return;
+
+  try {
+    await updateProjectFull(record.projectId, { logs: record.logs });
+  } catch (error) {
+    console.error("[Build Logs] Failed to persist command logs:", error.message);
+  }
 }
 
 /**
@@ -1255,32 +1285,66 @@ function pushLog(record, chunk) {
  * 按优先级检测：pnpm → npm → yarn
  * @returns {string} 包管理器命令
  */
-function getPackageManager() {
+function getPackageManager(cwd = "") {
   const isWin = process.platform === "win32";
+  const lockfileManagers = [
+    { lockfile: "pnpm-lock.yaml", manager: isWin ? "pnpm.cmd" : "pnpm" },
+    { lockfile: "package-lock.json", manager: isWin ? "npm.cmd" : "npm" },
+    { lockfile: "npm-shrinkwrap.json", manager: isWin ? "npm.cmd" : "npm" },
+    { lockfile: "yarn.lock", manager: isWin ? "yarn.cmd" : "yarn" }
+  ];
 
-  const managers = isWin ? ["pnpm.cmd", "npm.cmd", "yarn.cmd"] : ["pnpm", "npm", "yarn"];
+  for (const { lockfile, manager } of lockfileManagers) {
+    if (!existsSync(path.join(cwd, lockfile))) continue;
+
+    if (!isCommandAvailable(manager)) {
+      throw new Error(`Package manager not found: ${manager}. Required by ${lockfile}.`);
+    }
+
+    console.log(`[PackageManager] Using ${manager} for ${lockfile}`);
+    return manager;
+  }
+
+  const managers = isWin ? ["npm.cmd", "pnpm.cmd", "yarn.cmd"] : ["npm", "pnpm", "yarn"];
 
   for (const manager of managers) {
-    try {
-      const cmd = isWin ? `where ${manager}` : `which ${manager}`;
-      execSync(cmd, { stdio: "pipe" });
+    if (isCommandAvailable(manager)) {
       console.log(`[PackageManager] Using ${manager}`);
       return manager;
-    } catch {
-      // 未找到，继续尝试下一个
     }
   }
 
-  // 默认返回 npm
-  return isWin ? "npm.cmd" : "npm";
+  throw new Error("No supported package manager found in PATH. Install npm, pnpm, or yarn in the build container.");
 }
 
-/**
- * 获取 spawn 参数（Windows 需要通过 cmd.exe 执行）
- * @param {string} command - 原始命令
- * @param {string[]} args - 参数列表
- * @returns {object} { command, args }
- */
+function isCommandAvailable(command) {
+  const lookup = process.platform === "win32" ? `where ${command}` : `command -v ${command}`;
+
+  try {
+    execSync(lookup, { stdio: "pipe" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function getInstallArgs(packageManager) {
+  const normalized = packageManager.replace(/\.cmd$/i, "");
+
+  if (normalized === "npm") {
+    return ["install", "--include=dev"];
+  }
+
+  if (normalized === "pnpm") {
+    return ["install", "--prod=false"];
+  }
+
+  if (normalized === "yarn") {
+    return ["install", "--production=false"];
+  }
+
+  return ["install"];
+}
 function getSpawnSpec(command, args) {
   if (process.platform !== "win32") {
     return { command, args };
