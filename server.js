@@ -758,12 +758,12 @@ async function buildUploadedProject({ projectId, uploadPath, projectDir, preview
 
   // npm install
   await updateProjectStatus(projectId, "installing");
-  await runCommand(getNpmCommand(), ["install"], sourceDir, { logs });
+  await runCommand(getPackageManager(), ["install"], sourceDir, { logs });
 
   // npm build
   await updateProjectStatus(projectId, "building");
   const buildRecord = { dependencies, logs };
-  await runCommand(getNpmCommand(), getBuildArgs(buildRecord, projectId), sourceDir, { logs });
+  await runCommand(getPackageManager(), getBuildArgs(buildRecord, projectId), sourceDir, { logs });
 
   const distDir = await findBuildOutput(sourceDir);
   if (!distDir) {
@@ -843,11 +843,11 @@ async function buildVueComponentSandbox({ projectId, componentName, componentPat
 
   // npm install
   await updateProjectStatus(projectId, "installing");
-  await runCommand(getNpmCommand(), ["install"], projectDir, { logs });
+  await runCommand(getPackageManager(), ["install"], projectDir, { logs });
 
   // npm build
   await updateProjectStatus(projectId, "building");
-  await runCommand(getNpmCommand(), ["run", "build", "--", "--base", getPreviewAssetBase(projectId)], projectDir, { logs });
+  await runCommand(getPackageManager(), ["run", "build", "--", "--base", getPreviewAssetBase(projectId)], projectDir, { logs });
 
   const distDir = await findBuildOutput(projectDir);
   if (!distDir) {
@@ -1245,11 +1245,29 @@ function pushLog(record, chunk) {
 }
 
 /**
- * 获取 npm 可执行文件名（Windows 需要 .cmd 后缀）
- * @returns {string} npm 命令
+ * 获取包管理器命令
+ * 按优先级检测：pnpm → npm → yarn
+ * @returns {string} 包管理器命令
  */
-function getNpmCommand() {
-  return process.platform === "win32" ? "npm.cmd" : "npm";
+function getPackageManager() {
+  const { execSync } = require("child_process");
+  const isWin = process.platform === "win32";
+
+  const managers = isWin ? ["pnpm.cmd", "npm.cmd", "yarn.cmd"] : ["pnpm", "npm", "yarn"];
+
+  for (const manager of managers) {
+    try {
+      const cmd = isWin ? `where ${manager}` : `which ${manager}`;
+      execSync(cmd, { stdio: "pipe" });
+      console.log(`[PackageManager] Using ${manager}`);
+      return manager;
+    } catch {
+      // 未找到，继续尝试下一个
+    }
+  }
+
+  // 默认返回 npm
+  return isWin ? "npm.cmd" : "npm";
 }
 
 /**
