@@ -18,12 +18,12 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:
-      - xander-network
+      - common-network
 
 volumes:
   frontend-share-sandbox-storage:
     name: frontend-share-sandbox-storage
 
 networks:
-  xander-network:
+  common-network:
     external: true
