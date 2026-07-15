@@ -1475,9 +1475,10 @@ function analyzeVueSandbox(componentSource, demoSource, externalCssInput = "") {
   };
 
   for (const dependency of extractBareImports(source)) {
-    if (knownDependencyVersions[dependency]) {
-      dependencies[dependency] = knownDependencyVersions[dependency];
-    }
+    // Keep curated packages on tested versions, but do not require every
+    // component library to be added to this list before it can be previewed.
+    // npm resolves `latest` during the sandbox install for other valid imports.
+    dependencies[dependency] = knownDependencyVersions[dependency] || "latest";
   }
 
   const externalCss = normalizeExternalCss(externalCssInput);
@@ -1542,7 +1543,14 @@ function extractBareImports(source) {
 
   while ((match = importPattern.exec(source))) {
     const specifier = match[1] || match[2];
-    if (!specifier || specifier.startsWith(".") || specifier.startsWith("/") || specifier.startsWith("@/")) continue;
+    if (
+      !specifier
+      || specifier.startsWith(".")
+      || specifier.startsWith("/")
+      || specifier.startsWith("@/")
+      || specifier.startsWith("#")
+      || specifier.includes(":")
+    ) continue;
 
     const packageName = specifier.startsWith("@")
       ? specifier.split("/").slice(0, 2).join("/")
