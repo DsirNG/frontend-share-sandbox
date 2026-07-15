@@ -31,7 +31,7 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
 
-      - name: Pull source and restart service
+      - name: Pull source and run deployment script
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
@@ -43,6 +43,6 @@ jobs:
             git fetch --prune origin main
             git checkout main
             git reset --hard origin/main
-            docker compose -p frontend-share-sandbox up -d --build
+            bash scripts/deploy.sh
             docker image prune -f
           "
