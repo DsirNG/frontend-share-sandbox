@@ -5,6 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, execSync } from "node:child_process";
 import express from "express";
+import archiver from "archiver";
 import multer from "multer";
 import unzipper from "unzipper";
 import { nanoid } from "nanoid";
@@ -211,12 +212,21 @@ function deserializeProject(row) {
     status: row.status,
     framework: row.framework,
     previewUrl: row.preview_url,
+    visibility: row.visibility || "private",
     scripts: safeJsonParse(row.scripts, {}),
     dependencies: safeJsonParse(row.dependencies, {}),
     rootFiles: safeJsonParse(row.root_files, []),
     logs: safeJsonParse(row.logs, []),
     createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : String(row.created_at),
   };
+}
+
+function canAccessPublicSource(project) {
+  return project?.visibility === "open";
+}
+
+function getPublicProject(project) {
+  return { id: project.id, name: project.name, status: project.status, framework: project.framework, visibility: project.visibility, createdAt: project.createdAt };
 }
 
 /**
@@ -404,6 +414,82 @@ app.get("/studio-api/projects/:id", authMiddleware, async (req, res) => {
   } catch (error) {
     console.error("[GET /studio-api/projects/:id]", error.message);
     sendError(res, 500, "加载项目失败");
+  }
+});
+
+app.patch("/studio-api/projects/:id/visibility", authMiddleware, async (req, res) => {
+  const visibility = String(req.body?.visibility || "");
+  if (!new Set(["private", "public", "open"]).has(visibility)) {
+    sendError(res, 400, "无效的项目可见性");
+    return;
+  }
+  try {
+    const project = await findProject(req.params.id);
+    if (!project || project.userId !== req.userId) {
+      sendError(res, 404, "项目不存在");
+      return;
+    }
+    await updateProjectFull(project.id, { visibility });
+    res.json({ project: await getProjectById(project.id) });
+  } catch (error) {
+    console.error("[PATCH project visibility]", error.message);
+    sendError(res, 500, "更新项目可见性失败");
+  }
+});
+
+app.get("/studio-api/public/projects/:id", async (req, res) => {
+  try {
+    const project = await findProject(req.params.id);
+    if (!canAccessPublicSource(project)) return sendError(res, 404, "开源项目不存在或未公开");
+    res.json({ project: getPublicProject(project) });
+  } catch (error) {
+    sendError(res, 500, "加载开源项目失败");
+  }
+});
+
+app.get("/studio-api/public/projects/:id/files", async (req, res) => {
+  try {
+    const project = await findProject(req.params.id);
+    if (!canAccessPublicSource(project)) return sendError(res, 404, "开源项目不存在或未公开");
+    const sourceDir = await getProjectSourceDir(project.id);
+    if (!sourceDir) return sendError(res, 404, "项目文件不存在");
+    res.json({ tree: await buildFileTree(sourceDir) });
+  } catch (error) {
+    sendError(res, 500, error.message || "加载文件树失败");
+  }
+});
+
+app.get("/studio-api/public/projects/:id/files/content", async (req, res) => {
+  try {
+    const project = await findProject(req.params.id);
+    if (!canAccessPublicSource(project)) return sendError(res, 404, "开源项目不存在或未公开");
+    const sourceDir = await getProjectSourceDir(project.id);
+    const filePath = sourceDir && resolveProjectPath(sourceDir, String(req.query.path || ""));
+    if (!filePath) return sendError(res, 400, "无效的文件路径");
+    const stat = await fs.stat(filePath);
+    const extension = path.extname(filePath).toLowerCase();
+    if (!stat.isFile() || !readableFileExtensions.has(extension) || stat.size > maxReadableFileBytes) return sendError(res, 415, "该文件不支持文本预览");
+    res.json({ path: normalizeRelativePath(path.relative(sourceDir, filePath)), extension, size: stat.size, content: decodeTextContent(await fs.readFile(filePath)) });
+  } catch (error) {
+    sendError(res, 500, error.message || "加载文件失败");
+  }
+});
+
+app.get("/studio-api/public/projects/:id/download", async (req, res) => {
+  try {
+    const project = await findProject(req.params.id);
+    if (!canAccessPublicSource(project)) return sendError(res, 404, "开源项目不存在或未公开");
+    const sourceDir = await getProjectSourceDir(project.id);
+    if (!sourceDir) return sendError(res, 404, "项目文件不存在");
+    const filename = `${project.name.replace(/[\\/:*?\"<>|]/g, "-") || project.id}-source.zip`;
+    res.attachment(filename);
+    const archive = archiver("zip", { zlib: { level: 9 } });
+    archive.on("error", (error) => res.destroy(error));
+    archive.pipe(res);
+    archive.glob("**/*", { cwd: sourceDir, dot: true, ignore: [...ignoredArchiveDirs].map((name) => `${name}/**`) });
+    await archive.finalize();
+  } catch (error) {
+    sendError(res, 500, error.message || "下载源码失败");
   }
 });
 
