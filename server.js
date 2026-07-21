@@ -1138,12 +1138,28 @@ async function extractZipSafely(zipPath, destination, record) {
     }
 
     await fs.mkdir(path.dirname(outputPath), { recursive: true });
-    await new Promise((resolve, reject) => {
-      entry.stream()
-        .pipe(createWriteStream(outputPath))
-        .on("finish", resolve)
-        .on("error", reject);
-    });
+
+    const ext = path.extname(outputPath).toLowerCase();
+    const isTextFile = readableFileExtensions.has(ext);
+
+    if (isTextFile) {
+      const buf = await new Promise((resolve, reject) => {
+        const chunks = [];
+        entry.stream()
+          .on("data", (chunk) => chunks.push(chunk))
+          .on("end", () => resolve(Buffer.concat(chunks)))
+          .on("error", reject);
+      });
+      const decoded = decodeTextContent(buf);
+      await fs.writeFile(outputPath, decoded, "utf8");
+    } else {
+      await new Promise((resolve, reject) => {
+        entry.stream()
+          .pipe(createWriteStream(outputPath))
+          .on("finish", resolve)
+          .on("error", reject);
+      });
+    }
   }
 
   if (skippedDirs.size) {
