@@ -222,7 +222,7 @@ function deserializeProject(row) {
 }
 
 function canAccessPublicSource(project) {
-  return project?.visibility === "open";
+  return project?.visibility === "public";
 }
 
 function getPublicProject(project) {
@@ -419,7 +419,7 @@ app.get("/studio-api/projects/:id", authMiddleware, async (req, res) => {
 
 app.patch("/studio-api/projects/:id/visibility", authMiddleware, async (req, res) => {
   const visibility = String(req.body?.visibility || "");
-  if (!new Set(["private", "public", "open"]).has(visibility)) {
+  if (!new Set(["private", "public"]).has(visibility)) {
     sendError(res, 400, "无效的项目可见性");
     return;
   }
